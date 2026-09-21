@@ -1,0 +1,13 @@
+[project]
+name = "smart-mom-meet-recorder"
+version = "1.0.0"
+description = "Profile setup and meeting recording service"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "playwright>=1.48.0",
+    "python-dotenv>=1.0.0",
+    "pydub>=0.25.1",
+    "pyaudio>=0.2.14",
+]

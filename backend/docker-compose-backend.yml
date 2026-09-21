@@ -1,0 +1,83 @@
+services:
+  api:
+    build: .
+    image: smart-mom-ai
+    container_name: smart-mom-api
+    privileged: true
+    shm_size: 2gb
+    ipc: host
+    ports:
+      - "3014:3014"
+      - "6080:6080"
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - HOST=0.0.0.0
+      - PORT=3014
+      - DISPLAY=:99
+      - PULSE_SERVER=unix:/var/run/pulse/native
+    volumes:
+      - .:/app
+      - ./audio_files:/app/audio_files
+      - meet_bot_recordings:/tmp/meet-bot-recordings
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3014/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  worker:
+    build: .
+    image: smart-mom-ai
+    container_name: smart-mom-worker
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "celery,llm-generate,embed-chunks,diagram-gen,email-notifications,processing-queue", "--loglevel=INFO"]
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - .:/app
+      - ./audio_files:/app/audio_files
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beat:
+    build: .
+    image: smart-mom-ai
+    container_name: smart-mom-beat
+    command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=INFO"]
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: "redis:alpine"
+    container_name: smart-mom-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redis_data:
+  meet_bot_recordings:

@@ -1,0 +1,47 @@
+# version: '3.8'
+
+# # 🔵 Isolated Standalone GPU Machine Learning Subsystem
+# services:
+#   mom-gpu-transcription-service:
+#       build:
+#         context: ./transcription-service
+#         dockerfile: Dockerfile
+#       container_name: mom-gpu-transcription-engine
+#       restart: unless-stopped
+#       ports:
+#         - "3000:3000"
+#       env_file:
+#         - .env
+#       environment:
+#         - BACKEND_API_URL=http://13.232.78.99:3014
+#         - DEVICE=${DEVICE:-cuda}
+#         - COMPUTE_TYPE=${COMPUTE_TYPE:-float16}
+#       volumes:
+#         - tmp_audio_data:/tmp
+#       # ⚠️ CRITICAL: Allocates host physical GPU pipelines directly inside the container instance
+#       deploy:
+#         resources:
+#           reservations:
+#             devices:
+#               - driver: nvidia
+#                 count: all
+#                 capabilities: [gpu]
+
+# volumes:
+#   tmp_audio_data:
+
+version: '3.8'
+
+services:
+  # 🔵 Mock Transcription Engine (No GPU Required)
+  mock-transcription-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mom-mock-transcription
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      # Tells the mock service how to find the backend container for its callback
+      - BACKEND_API_URL=http://13.232.78.99:3014

@@ -1,0 +1,21 @@
+
+services:
+  meet-recorder:
+    build: .
+    container_name: smart-mom-recorder
+    privileged: true
+    shm_size: 2gb
+    ipc: host
+    ports:
+      - "4001:8000"
+      - "4002:6080"
+    volumes:
+      - ./recordings:/recordings
+    environment:
+      - DISPLAY=:99
+      - PULSE_SERVER=unix:/var/run/pulse/native
+      - RECORDINGS_DIR=/recordings
+      - CHROME_BASE_PROFILE=/tmp/chrome-profile
+      - CHROME_BACKUP_PROFILE=/tmp/chrome-profile-backup
+      - LOGIN_TIMEOUT=300
+      - STAY_DURATION_SECONDS=0
