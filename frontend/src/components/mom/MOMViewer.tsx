@@ -469,7 +469,7 @@ export function MOMViewer({ meeting, onRegenerate, regenerating }: MOMViewerProp
           {/* 6. NEXT STEPS */}
           {parsed.nextSteps.length > 0 && <NextStepsSection nextSteps={parsed.nextSteps} />}
 
-          {/* 7. MOOD OF THE CLIENT */}
+          {/* 7. MOOD OF THE CLIENT/STAKEHOLDER */}
           {parsed.moodOfClient.length > 0 && <MoodOfClientSection moodOfClient={parsed.moodOfClient} />}
 
           {/* 8. OUT OF SCOPE DISCUSSION */}
@@ -747,7 +747,7 @@ export function MOMViewer({ meeting, onRegenerate, regenerating }: MOMViewerProp
               </div>
             )}
 
-            {/* 7. MOOD OF THE CLIENT */}
+            {/* 7. MOOD OF THE CLIENT/STAKEHOLDER */}
             {parsed.moodOfClient.filter(s => {
               const cleaned = s.replace(/\*\*/g, "").trim().toLowerCase();
               return cleaned.length > 5
@@ -758,7 +758,7 @@ export function MOMViewer({ meeting, onRegenerate, regenerating }: MOMViewerProp
             }).length > 0 && (
               <div className="mb-3 no-break" style={{ marginBottom: "12px", pageBreakInside: "avoid" }}>
                 <h2 className="text-base font-bold text-gray-900 uppercase border-b-2 border-[#0E6655] pb-1 mb-2" style={{ margin: "8px 0 8px 0" }}>
-                  7. Mood of the Client
+                  7. Mood of the Client/Stakeholder
                 </h2>
                 <div className="text-sm" style={{ paddingLeft: "20px" }}>
                   {parsed.moodOfClient

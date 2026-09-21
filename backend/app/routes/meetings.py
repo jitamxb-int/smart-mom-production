@@ -1117,7 +1117,7 @@ async def trigger_generation(
         "- {Continue for all agreed next steps and follow-up actions}\n\n"
 
         "---\n\n"
-        "## 7. MOOD OF THE CLIENT\n\n"
+        "## 7. MOOD OF THE CLIENT/STAKEHOLDER\n\n"
         "- {Analyse each speaker’s tone, sentiment, and intent based strictly on their statements in the transcript}\n"
         "- {Identify and describe the emotional or professional stance of key participants (e.g., positive, concerned, neutral, frustrated, confident)}\n"
         "- {Highlight any notable shifts in mood during the meeting and attribute them where possible}\n"

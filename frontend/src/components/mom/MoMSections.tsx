@@ -425,7 +425,7 @@ export function NextStepsSection({ nextSteps }: NextStepsSectionProps) {
 }
 
 // =====================================================
-// Mood of the CLIENT Section
+// MOOD OF THE CLIENT/STAKEHOLDER Section
 // =====================================================
 
 interface MoodOfClientSectionProps {
@@ -451,7 +451,7 @@ export function MoodOfClientSection({ moodOfClient }: MoodOfClientSectionProps) 
   return (
     <section className="mb-16">
       <div className="flex items-center gap-4 mb-6">
-        <h2 className="text-2xl font-bold tracking-tight text-primary uppercase font-headline">7. Mood of the Client</h2>
+        <h2 className="text-2xl font-bold tracking-tight text-primary uppercase font-headline">7. Mood of the Client/Stakeholder</h2>
         <div className="flex-grow h-px bg-slate-200"></div>
       </div>
       <div className="bg-surface-container-low rounded-xl p-8">
