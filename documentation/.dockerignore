@@ -1,0 +1,7 @@
+site/
+.venv/
+mcp-server/.venv/
+__pycache__/
+*.pyc
+.git/
+mkdocs-serve.log

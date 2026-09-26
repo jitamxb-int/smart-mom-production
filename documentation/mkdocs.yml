@@ -1,0 +1,82 @@
+site_name: Smart MoM — Engineering Handbook
+site_description: Architecture, API, and full codebase reference for the Smart MoM AI meeting intelligence platform.
+docs_dir: docs
+repo_url: https://github.com/jitamxb-int/smart-mom-production
+repo_name: jitamxb-int/smart-mom-production
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Data Flow & Sequence Diagrams: architecture/data-flow.md
+      - Database Schema: architecture/database-schema.md
+  - Backend:
+      - Overview & Structure: backend/overview.md
+      - Authentication: backend/authentication.md
+      - API Reference: backend/api-reference.md
+      - Data Models: backend/data-models.md
+      - Background Workers: backend/workers.md
+      - Storage & Audio Pipeline: backend/storage-audio.md
+      - Error Logging System: backend/error-logging.md
+      - Meet Bot Module: backend/meet-bot.md
+  - Frontend:
+      - Overview & Structure: frontend/overview.md
+      - Pages & Routing: frontend/pages-routing.md
+      - State Management: frontend/state-management.md
+      - API Client Layer: frontend/api-client.md
+      - Key Components: frontend/components.md
+  - Auxiliary Services:
+      - Meet Bot Integration Service: services/meet-bot-integration.md
+      - Transcription Service: services/transcription-service.md
+  - Operations:
+      - Deployment: operations/deployment.md
+      - Known Issues & Tech Debt: operations/known-issues.md
+      - Security Notes: operations/security-notes.md
+  - MCP Docs Server: mcp-server.md

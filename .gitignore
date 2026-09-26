@@ -1,0 +1,12 @@
+# MkDocs build output
+documentation/site/
+
+# Python virtual environments used for docs/MCP tooling
+documentation/.venv/
+documentation/mcp-server/.venv/
+__pycache__/
+*.pyc
+documentation/mkdocs-serve.log
+
+# Real MCP auth token — never commit this, only .env.example
+documentation/.env
