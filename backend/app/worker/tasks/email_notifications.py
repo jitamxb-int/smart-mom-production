@@ -9,6 +9,7 @@ from bson.errors import InvalidId
 
 from app.core.config import settings
 from app.core.email import send_transcription_ready_notification, PermanentEmailError
+from app.core.error_logger import log_error
 
 
 logger = get_task_logger(__name__)
@@ -133,6 +134,13 @@ def send_transcription_ready_email(self, user_id, meeting_id):
 
     except Exception as exc:
         logger.exception("Email task failed | meeting_id=%s | error=%s", meeting_id, exc)
+        db_for_log = locals().get("sync_db")
+        if db_for_log is not None:
+            log_error(
+                exc, db_for_log,
+                source="manual:email_notifications.send_transcription_ready_email",
+                context={"meeting_id": meeting_id, "user_id": user_id},
+            )
         countdown = min(2 ** self.request.retries * 5, 60)
         logger.info("Retrying email task | meeting_id=%s | countdown=%s", meeting_id, countdown)
         raise self.retry(exc=exc, countdown=countdown)

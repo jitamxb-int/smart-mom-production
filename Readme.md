@@ -34,6 +34,10 @@ The AI-powered meeting intelligence platform — record, transcribe, summarise, 
 
 ---------------------------------------------
 
+📚 **Full engineering handbook:** this README is a quick-start summary. For the complete, code-verified reference — every API endpoint, data model, Celery task, Redux slice, sequence diagrams, the Meet Bot, the transcription service, known issues, and security notes — see [`documentation/`](documentation/docs/index.md), a self-contained MkDocs site with its own `Dockerfile`/`docker-compose.yml` for hosting it separately (see [documentation/docs/operations/deployment.md](documentation/docs/operations/deployment.md)). It's also queryable by Claude Code / OpenCode via the MCP server at [`documentation/mcp-server/`](documentation/mcp-server/README.md) — see [documentation/docs/mcp-server.md](documentation/docs/mcp-server.md).
+
+---------------------------------------------
+
 **Stack:** FastAPI · Next.js 14 · MongoDB Atlas · Redis · Celery · OpenAI GPT-4o · Qdrant · AWS S3 · ffmpeg<br>
 **Platforms:** Web Browser · Mobile (iOS/Android via expo-audio)
 
@@ -53,7 +57,9 @@ The AI-powered meeting intelligence platform — record, transcribe, summarise, 
    - [Audio Storage Backends](#audio-storage-backends)
    - [Audio Chunk Merging](#audio-chunk-merging)
    - [Background Task Queues](#background-task-queues)
+   - [Error Logging](#error-logging)
    - [Project Structure](#backend-project-structure)
+   - [Detailed Architecture Diagram](#detailed-architecture-diagram)
 5. [Frontend](#frontend)
    - [Prerequisites](#frontend-prerequisites)
    - [Environment Variables](#frontend-environment-variables)
@@ -291,6 +297,7 @@ cp .env.example .env
 | `CORS_ORIGINS` | ❌ | `http://localhost:3015,http://localhost:3002` | Comma-separated allowed origins |
 | `BACKEND1_HMAC_SECRET` | ❌ | — | HMAC secret for transcript callback verification |
 | `ENVIRONMENT` | ❌ | `production` | `development` or `production` |
+| `ERROR_LOG_TTL_HOURS` | ❌ | `72` | How long captured `error_logs` documents live before MongoDB's TTL index auto-deletes them |
 
 > **AWS Authentication:** The backend uses IAM instance roles on EC2 — no `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` are needed or should be stored. On local development with local storage mode, AWS credentials are not required at all.
 
@@ -449,6 +456,10 @@ All endpoints require `Authorization: Bearer <token>` unless otherwise noted.
 | `POST` | `/api/v1/admin/meetings/index-unindexed` | 🔐 Admin | Bulk-index all unindexed meetings |
 | `GET` | `/api/v1/admin/meetings/next-pending` | 🔐 Admin | Get oldest meeting awaiting processing |
 | `GET` | `/api/v1/admin/meetings/stuck-chunked` | 🔐 Admin | List meetings stuck in chunked state |
+| `GET` | `/api/v1/admin/error-logs` | 🔐 Admin | List captured error logs (paginated, filterable by module/source/status/search/date) |
+| `GET` | `/api/v1/admin/error-logs/{id}` | 🔐 Admin | Get full detail for one error log, including untruncated traceback |
+| `DELETE` | `/api/v1/admin/error-logs/{id}` | 🔐 Admin | Delete a single error log entry |
+| `DELETE` | `/api/v1/admin/error-logs` | 🔐 Admin | Bulk-clear all captured error logs |
 
 #### Health
 
@@ -507,6 +518,18 @@ Celery processes three queues, each handled by a separate task module:
 
 ---
 
+### Error Logging
+
+Every unhandled exception, plus a number of previously "swallowed" `except Exception` blocks across the routes and Celery tasks (best-effort cleanup, non-fatal indexing/upload failures, etc.), are persisted to a dedicated `error_logs` MongoDB collection via `app/core/error_logger.py`'s `log_error()` helper — surfaced in the frontend's **Admin → Error Logs** tab.
+
+- **Auto-derived location:** `log_error()` walks the exception's traceback to find the deepest frame inside `backend/app/`, so each document records the exact `module`, `function`, `file_path`, and `line_number` where the error actually occurred — no need to pass these manually at each call site.
+- **Captured fields:** exception type/message, full traceback, the originating HTTP method/path/status code (when applicable), the requesting user's `user_id`/`user_email`, a `source` tag (`http_exception_handler` for the global handler, `manual:<tag>` for an explicitly instrumented call site), and free-form `context`.
+- **Works from both async and sync callers:** the same `log_error()` call is safe to use from FastAPI routes (async Motor `db`) and from Celery tasks (sync pymongo `db`) — it detects which one it received automatically.
+- **Never blocks or crashes the caller:** logging failures are swallowed internally and never propagate, and the Mongo insert runs as a fire-and-forget `asyncio.create_task` in async contexts so it never adds latency to the response.
+- **Auto-expiry:** a MongoDB TTL index on `timestamp` deletes documents automatically after `ERROR_LOG_TTL_HOURS` (default 72h). Changing the value requires a backend restart — `connect_db()` reconciles the index via `collMod` on every startup so the new TTL takes effect.
+
+---
+
 ### Backend Project Structure
 
 ```
@@ -518,6 +541,7 @@ app/
 ├── core/
 │   ├── audio_merge.py   — Format detection + ffmpeg/naive merge logic
 │   ├── config.py        — Pydantic settings (reads from .env)
+│   ├── error_logger.py  — log_error() helper: persists exceptions to error_logs
 │   ├── s3_utils.py      — S3 presigned URL helpers
 │   └── storage.py       — Storage abstraction (S3 / Local)
 ├── db/
@@ -540,6 +564,124 @@ app/
         ├── diagram_gen.py   — GPT-4o diagram generation task
         ├── embed_chunks.py  — RAG embedding task
         └── llm_generate.py  — MoM / Summary / Key Points task
+```
+
+---
+
+### Detailed Architecture Diagram
+
+**1. Request flow — clients through the API to every data store and external service**
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                                    CLIENTS                                     │
+│         Web Browser (Next.js :3015)          │        Mobile App (Expo)       │
+└─────────────────────┬───────────────────────────┴──────────────┬──────────────┘
+                       │  REST + SSE (Bearer JWT)                 │  REST (Bearer JWT)
+                       ▼                                          ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                     FastAPI Backend — app/main.py   (:3014)                   │
+│                                                                                 │
+│   CORSMiddleware  ──▶  OPTIONS preflight short-circuit  ──▶  Router dispatch   │
+│                                                                     │           │
+│                                                                     ▼           │
+│                              ┌──────────────────────────────────────────────┐  │
+│                              │  @app.exception_handler(Exception)            │  │
+│                              │  logger.error(exc_info=True)                  │  │
+│                              │       │                                       │  │
+│                              │       ▼                                       │  │
+│                              │  core/error_logger.log_error(exc, get_db(),   │  │
+│                              │      request=request,                        │  │
+│                              │      source="http_exception_handler")        │  │
+│                              └──────────────────────────────────────────────┘  │
+└───┬────────┬─────────┬─────────┬─────────┬─────────┬─────────┬────────────────┘
+    │        │         │         │         │         │         │
+    ▼        ▼         ▼         ▼         ▼         ▼         ▼
+  auth/   routes/   routes/   routes/   routes/   routes/   routes/bot_recording.py
+  routes  meetings  chat      diagrams  stats     admin     routes/bot_setup.py
+  .py     .py       .py       .py       .py       .py       routes/processing.py
+    │        │         │         │         │         │         │
+    ▼        ▼         ▼         ▼         ▼         ▼         ▼
+┌──────────────────┐  ┌───────────────────┐  ┌───────────────────┐  ┌───────────────────┐
+│  MongoDB Atlas    │  │  Redis             │  │  Qdrant Cloud      │  │  AWS S3            │
+│  (Motor, async)   │  │  JWT blacklist +   │  │  Vector store      │  │  audio files       │
+│                   │  │  Celery broker     │  │  (RAG embeddings)  │  │  (or local disk)   │
+│  users            │  └─────────┬──────────┘  └───────────────────┘  └───────────────────┘
+│  meetings         │            │
+│  chat_sessions    │            ▼
+│  audio_chunks     │   Celery Workers  (worker/celery_app.py)
+│  processing_queue │     queue  llm-generate   ──▶ OpenAI GPT-4o
+│  system_config    │     queue  embed-chunks   ──▶ OpenAI Embeddings
+│  error_logs (TTL) │     queue  diagram-gen    ──▶ OpenAI GPT-4o
+└───────────────────┘     on except Exception   ──▶ error_logger.log_error()  (sync pymongo db)
+
+  Meet Bot  (Playwright + Chrome + Xvfb + PulseAudio subprocess)
+  — invoked by routes/bot_recording.py and routes/bot_setup.py, independent of Celery
+```
+
+**2. Router → dependency map** (what each router in `app/routes/` actually talks to)
+
+```
+auth/routes.py         ──▶ auth/jwt.py (get_current_user, require_admin)
+                        ──▶ db.users                                   ──▶ Redis (blacklist on logout)
+                        ──▶ Google OAuth 2.0
+
+routes/meetings.py     ──▶ core/storage.py  (S3Storage | LocalStorage) ──▶ core/s3_utils.py ──▶ AWS S3
+                        ──▶ core/audio_merge.py (WebM concat | ffmpeg concat for mobile MP4)
+                        ──▶ db.meetings / db.audio_chunks / db.processing_queue
+                        ──▶ core/error_logger.log_error()  (chunk upload / merge / RAG / OpenAI failures)
+                        ──▶ Qdrant  (inline RAG indexing)   ──▶ OpenAI (embeddings, GPT-4o generation)
+
+routes/chat.py         ──▶ db.chat_sessions
+                        ──▶ Qdrant  (vector search, RAG context)
+                        ──▶ OpenAI  (streamed SSE completion)
+                        ──▶ core/error_logger.log_error()  (persist / pipeline failures)
+
+routes/diagrams.py     ──▶ Celery: worker/tasks/diagram_gen.py  (status polling)
+
+routes/stats.py        ──▶ db.meetings  (aggregation pipelines)
+
+routes/admin.py        ──▶ db.users / db.meetings / db.system_config   (require_admin on every route)
+                        ──▶ db.error_logs   (list / detail / delete / clear-all — Error Logs tab)
+                        ──▶ core/error_logger.log_error()  (Qdrant cleanup / bulk-index failures)
+
+routes/processing.py   ──▶ db.processing_queue  (admin-configurable processing window)
+
+routes/bot_recording.py┐
+routes/bot_setup.py    ├──▶ meet_bot/record_meeting.py + meet_bot/setup_login.py
+                        │      (Playwright + Chrome + Xvfb + PulseAudio subprocess)
+```
+
+**3. Error-logging pipeline** (every capture path funnels into the same collection)
+
+```
+Unhandled exception                Swallowed "except Exception" block         Celery task failure
+(any route)                        (routes/*.py, best-effort cleanup)         (worker/tasks/*.py)
+      │                                          │                                    │
+      ▼                                          ▼                                    ▼
+main.py global_exception_handler   log_error(e, db, source="manual:<tag>")   log_error(exc, get_sync_db(),
+      │                                          │                             source="manual:<task>")
+      └──────────────────────────┬───────────────┴────────────────────────────────────┘
+                                  ▼
+                    core/error_logger.py  log_error()
+                    ├─ walk exc.__traceback__ → deepest frame inside backend/app/
+                    ├─ derive module / function / file_path / line_number automatically
+                    ├─ capture exception_type, message, full traceback, request info,
+                    │   user_id / user_email, status_code, free-form context
+                    └─ async Motor db  → asyncio.create_task(insert)   (fire-and-forget)
+                       sync pymongo db → direct insert_one()
+                                  │
+                                  ▼
+                    MongoDB  db.error_logs
+                    ├─ TTL index on `timestamp`, expireAfterSeconds = ERROR_LOG_TTL_HOURS × 3600
+                    └─ [("module", 1), ("timestamp", -1)] index for filtering
+                                  │
+                                  ▼
+              GET /api/v1/admin/error-logs*  (require_admin)
+                                  │
+                                  ▼
+       Frontend  /dashboard/admin → "Error Logs" tab
+       (search, module filter, pagination, traceback detail modal, delete / clear-all)
 ```
 
 ---
@@ -649,7 +791,7 @@ docker compose -f docker-compose-frontend.yml down
 | `/dashboard/meetings/[id]` | Meeting detail with tabbed AI outputs (Minutes, Summary, Key Points, Transcript), Mermaid diagram, chat index status, download audio, and delete |
 | `/dashboard/record` | Audio recording in chunk-upload mode. Fill in meeting details, then record. Chunks upload every 30 seconds. Offline caching via IndexedDB with automatic retry on reconnect. |
 | `/dashboard/chat` | Global chat interface. Ask questions across all indexed meetings or scope to specific meetings using the multi-select dropdown. Streams responses via SSE. |
-| `/dashboard/admin` | Admin-only panel with platform stats, user management (role change, delete), all-meetings table, and audio storage backend configuration |
+| `/dashboard/admin` | Admin-only panel with platform stats, user management (role change, delete), all-meetings table, audio storage backend configuration, RAG indexing tools, and an Error Logs tab (searchable/filterable list of captured backend errors with full traceback detail, delete/clear-all) |
 
 #### Key Frontend Features
 

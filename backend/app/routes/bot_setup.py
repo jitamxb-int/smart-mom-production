@@ -10,6 +10,8 @@ from pydantic import BaseModel
 
 from app.auth.jwt import get_current_user
 from app.core.config import settings
+from app.core.error_logger import log_error
+from app.db.database import get_db
 
 router = APIRouter(prefix="/api/v1/meetings/bot/setup", tags=["meet-bot"])
 
@@ -46,6 +48,11 @@ async def _run_login_background(task_id: str, delete_existing: bool = False):
             if task_id in _login_tasks:
                 _login_tasks[task_id]["status"] = "failed"
                 _login_tasks[task_id]["error"] = str(e)
+        log_error(
+            e, get_db(),
+            source="manual:_run_login_background",
+            context={"task_id": task_id, "delete_existing": delete_existing},
+        )
 
 
 @router.post("/login")

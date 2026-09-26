@@ -10,6 +10,7 @@ from app.db.database import get_db
 from app.db.qdrant_client import get_qdrant
 from app.models.meeting import ChatRequest
 from app.core.config import settings
+from app.core.error_logger import log_error
 import logging
 
 logger = logging.getLogger(__name__)
@@ -163,8 +164,22 @@ async def chat(body: ChatRequest, current_user: dict = Depends(get_current_user)
                 })
             except Exception as e:
                 logger.warning(f"Failed to persist chat session: {e}")
+                log_error(
+                    e, db,
+                    source="manual:chat_persist_session",
+                    user_id=user_id,
+                    user_email=current_user.get("email"),
+                    context={"meeting_id": body.meeting_id, "meeting_ids": meeting_ids},
+                )
         except Exception as e:
             logger.error(f"Chat error: {e}")
+            log_error(
+                e, db,
+                source="manual:chat_pipeline_error",
+                user_id=user_id,
+                user_email=current_user.get("email"),
+                context={"meeting_id": body.meeting_id, "meeting_ids": meeting_ids},
+            )
             yield {"data": json.dumps({"type": "error", "message": str(e)})}
 
     return EventSourceResponse(event_generator())

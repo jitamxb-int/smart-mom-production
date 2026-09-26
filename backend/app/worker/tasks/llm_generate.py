@@ -8,6 +8,7 @@ from datetime import datetime
 from celery import shared_task
 from app.worker.celery_app import celery_app
 from app.core.config import settings
+from app.core.error_logger import log_error
 import logging
 
 logger = logging.getLogger(__name__)
@@ -294,4 +295,9 @@ def generate_llm_output(self, meeting_id: str, output_type: str):
 
     except Exception as exc:
         logger.error(f"LLM generate error for {meeting_id}: {exc}")
+        log_error(
+            exc, db,
+            source="manual:llm_generate.generate_llm_output",
+            context={"meeting_id": meeting_id, "output_type": output_type},
+        )
         raise self.retry(exc=exc, countdown=5)

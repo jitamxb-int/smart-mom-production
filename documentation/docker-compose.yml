@@ -1,0 +1,38 @@
+services:
+  docs:
+    build:
+      context: .
+      target: site
+    image: smart-mom-docs
+    container_name: smart-mom-docs
+    ports:
+      - "3013:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Exposes documentation/mcp-server/server.py over the network (streamable-HTTP)
+  # instead of stdio, so Claude Code / OpenCode can attach with just a URL — no
+  # local checkout or Python needed on the client side. See docs/mcp-server.md.
+  # Auth-free by default (no MCP_AUTH_TOKEN) — anyone who can reach this port
+  # can call its tools. Set MCP_AUTH_TOKEN in documentation/.env (see
+  # .env.example) to require a bearer token instead.
+  mcp:
+    build:
+      context: .
+      target: mcp
+    image: smart-mom-docs-mcp
+    container_name: smart-mom-docs-mcp
+    ports:
+      - "3012:8006"
+    environment:
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8006/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
