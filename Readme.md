@@ -34,6 +34,10 @@ The AI-powered meeting intelligence platform — record, transcribe, summarise, 
 
 ---------------------------------------------
 
+📚 **Full engineering handbook:** this README is a quick-start summary. For the complete, code-verified reference — every API endpoint, data model, Celery task, Redux slice, sequence diagrams, the Meet Bot, the transcription service, known issues, and security notes — see [`documentation/`](documentation/docs/index.md), a self-contained MkDocs site with its own `Dockerfile`/`docker-compose.yml` for hosting it separately (see [documentation/docs/operations/deployment.md](documentation/docs/operations/deployment.md)). It's also queryable by Claude Code / OpenCode via the MCP server at [`documentation/mcp-server/`](documentation/mcp-server/README.md) — see [documentation/docs/mcp-server.md](documentation/docs/mcp-server.md).
+
+---------------------------------------------
+
 **Stack:** FastAPI · Next.js 14 · MongoDB Atlas · Redis · Celery · OpenAI GPT-4o · Qdrant · AWS S3 · ffmpeg<br>
 **Platforms:** Web Browser · Mobile (iOS/Android via expo-audio)
 

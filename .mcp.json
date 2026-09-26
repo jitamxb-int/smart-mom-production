@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "smart-mom-docs": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["documentation/mcp-server/server.py"],
+      "env": {}
+    }
+  }
+}
