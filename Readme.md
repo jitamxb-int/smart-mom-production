@@ -53,6 +53,7 @@ The AI-powered meeting intelligence platform — record, transcribe, summarise, 
    - [Audio Storage Backends](#audio-storage-backends)
    - [Audio Chunk Merging](#audio-chunk-merging)
    - [Background Task Queues](#background-task-queues)
+   - [Error Logging](#error-logging)
    - [Project Structure](#backend-project-structure)
 5. [Frontend](#frontend)
    - [Prerequisites](#frontend-prerequisites)
@@ -291,6 +292,7 @@ cp .env.example .env
 | `CORS_ORIGINS` | ❌ | `http://localhost:3015,http://localhost:3002` | Comma-separated allowed origins |
 | `BACKEND1_HMAC_SECRET` | ❌ | — | HMAC secret for transcript callback verification |
 | `ENVIRONMENT` | ❌ | `production` | `development` or `production` |
+| `ERROR_LOG_TTL_HOURS` | ❌ | `72` | How long captured `error_logs` documents live before MongoDB's TTL index auto-deletes them |
 
 > **AWS Authentication:** The backend uses IAM instance roles on EC2 — no `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` are needed or should be stored. On local development with local storage mode, AWS credentials are not required at all.
 
@@ -449,6 +451,10 @@ All endpoints require `Authorization: Bearer <token>` unless otherwise noted.
 | `POST` | `/api/v1/admin/meetings/index-unindexed` | 🔐 Admin | Bulk-index all unindexed meetings |
 | `GET` | `/api/v1/admin/meetings/next-pending` | 🔐 Admin | Get oldest meeting awaiting processing |
 | `GET` | `/api/v1/admin/meetings/stuck-chunked` | 🔐 Admin | List meetings stuck in chunked state |
+| `GET` | `/api/v1/admin/error-logs` | 🔐 Admin | List captured error logs (paginated, filterable by module/source/status/search/date) |
+| `GET` | `/api/v1/admin/error-logs/{id}` | 🔐 Admin | Get full detail for one error log, including untruncated traceback |
+| `DELETE` | `/api/v1/admin/error-logs/{id}` | 🔐 Admin | Delete a single error log entry |
+| `DELETE` | `/api/v1/admin/error-logs` | 🔐 Admin | Bulk-clear all captured error logs |
 
 #### Health
 
@@ -507,6 +513,18 @@ Celery processes three queues, each handled by a separate task module:
 
 ---
 
+### Error Logging
+
+Every unhandled exception, plus a number of previously "swallowed" `except Exception` blocks across the routes and Celery tasks (best-effort cleanup, non-fatal indexing/upload failures, etc.), are persisted to a dedicated `error_logs` MongoDB collection via `app/core/error_logger.py`'s `log_error()` helper — surfaced in the frontend's **Admin → Error Logs** tab.
+
+- **Auto-derived location:** `log_error()` walks the exception's traceback to find the deepest frame inside `backend/app/`, so each document records the exact `module`, `function`, `file_path`, and `line_number` where the error actually occurred — no need to pass these manually at each call site.
+- **Captured fields:** exception type/message, full traceback, the originating HTTP method/path/status code (when applicable), the requesting user's `user_id`/`user_email`, a `source` tag (`http_exception_handler` for the global handler, `manual:<tag>` for an explicitly instrumented call site), and free-form `context`.
+- **Works from both async and sync callers:** the same `log_error()` call is safe to use from FastAPI routes (async Motor `db`) and from Celery tasks (sync pymongo `db`) — it detects which one it received automatically.
+- **Never blocks or crashes the caller:** logging failures are swallowed internally and never propagate, and the Mongo insert runs as a fire-and-forget `asyncio.create_task` in async contexts so it never adds latency to the response.
+- **Auto-expiry:** a MongoDB TTL index on `timestamp` deletes documents automatically after `ERROR_LOG_TTL_HOURS` (default 72h). Changing the value requires a backend restart — `connect_db()` reconciles the index via `collMod` on every startup so the new TTL takes effect.
+
+---
+
 ### Backend Project Structure
 
 ```
@@ -518,6 +536,7 @@ app/
 ├── core/
 │   ├── audio_merge.py   — Format detection + ffmpeg/naive merge logic
 │   ├── config.py        — Pydantic settings (reads from .env)
+│   ├── error_logger.py  — log_error() helper: persists exceptions to error_logs
 │   ├── s3_utils.py      — S3 presigned URL helpers
 │   └── storage.py       — Storage abstraction (S3 / Local)
 ├── db/
@@ -649,7 +668,7 @@ docker compose -f docker-compose-frontend.yml down
 | `/dashboard/meetings/[id]` | Meeting detail with tabbed AI outputs (Minutes, Summary, Key Points, Transcript), Mermaid diagram, chat index status, download audio, and delete |
 | `/dashboard/record` | Audio recording in chunk-upload mode. Fill in meeting details, then record. Chunks upload every 30 seconds. Offline caching via IndexedDB with automatic retry on reconnect. |
 | `/dashboard/chat` | Global chat interface. Ask questions across all indexed meetings or scope to specific meetings using the multi-select dropdown. Streams responses via SSE. |
-| `/dashboard/admin` | Admin-only panel with platform stats, user management (role change, delete), all-meetings table, and audio storage backend configuration |
+| `/dashboard/admin` | Admin-only panel with platform stats, user management (role change, delete), all-meetings table, audio storage backend configuration, RAG indexing tools, and an Error Logs tab (searchable/filterable list of captured backend errors with full traceback detail, delete/clear-all) |
 
 #### Key Frontend Features
 

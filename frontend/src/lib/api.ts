@@ -176,4 +176,27 @@ export const adminApi = {
 
   stuckChunked: (page = 1, limit = 50) =>
     apiClient.get("/api/v1/admin/meetings/stuck-chunked", { params: { page, limit } }),
+
+  errorLogs: (
+    page = 1,
+    limit = 50,
+    filters?: {
+      module?: string;
+      source?: string;
+      status_code?: number;
+      search?: string;
+      date_from?: string;
+      date_to?: string;
+    },
+  ) =>
+    apiClient.get("/api/v1/admin/error-logs", { params: { page, limit, ...filters } }),
+
+  errorLogDetail: (logId: string) =>
+    apiClient.get(`/api/v1/admin/error-logs/${logId}`),
+
+  deleteErrorLog: (logId: string) =>
+    apiClient.delete(`/api/v1/admin/error-logs/${logId}`),
+
+  clearErrorLogs: () =>
+    apiClient.delete("/api/v1/admin/error-logs"),
 };

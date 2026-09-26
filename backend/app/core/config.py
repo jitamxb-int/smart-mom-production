@@ -115,6 +115,16 @@ class Settings(BaseSettings):
     # Override with an absolute path in production, e.g. /var/meetmind/audio
     audio_local_path: str = "./audio_files"
 
+    # ── Error Logs ────────────────────────────────────────────────────────────────
+    # How long captured error_logs documents are retained before MongoDB's TTL
+    # index auto-deletes them. Changing this requires a backend restart so
+    # connect_db() can reconcile the TTL index (see db/database.py).
+    error_log_ttl_hours: int = 72
+
+    @property
+    def error_log_ttl_seconds(self) -> int:
+        return self.error_log_ttl_hours * 3600
+
     @property
     def cors_origins_list(self) -> List[str]:
         """Return cors_origins as a parsed list."""

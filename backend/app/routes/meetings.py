@@ -19,6 +19,7 @@ from pymongo.errors import DuplicateKeyError
 from pymongo import ReturnDocument
 from app.auth.jwt import get_current_user
 from app.db.database import get_db
+from app.core.error_logger import log_error
 from app.models.meeting import (
     MeetingDetailResponse, UpdateMeetingRequest,
     CreateMeetingRequest, IMMUTABLE_FIELDS,
@@ -190,6 +191,14 @@ async def upload_audio_direct(
         storage.upload_audio(data, s3_key)
     except Exception as e:
         logger.error(f"Direct upload failed: {e}")
+        log_error(
+            e, get_db(),
+            source="manual:upload_audio_direct",
+            user_id=current_user.get("user_id"),
+            user_email=current_user.get("email"),
+            context={"meeting_id": meeting_id, "s3_key": s3_key},
+            status_code=500,
+        )
         raise HTTPException(status_code=500, detail={"code": "UPLOAD_FAILED", "message": str(e)})
 
     return {"success": True, "audio_s3_key": s3_key, "size_bytes": len(data)}
@@ -220,6 +229,14 @@ async def stream_audio_local(
         raise HTTPException(status_code=404, detail={"code": "AUDIO_NOT_FOUND",
             "message": f"Audio file not found on disk for key: {key}"})
     except Exception as e:
+        log_error(
+            e, db,
+            source="manual:stream_audio_local",
+            user_id=current_user.get("user_id"),
+            user_email=current_user.get("email"),
+            context={"key": key},
+            status_code=500,
+        )
         raise HTTPException(status_code=500, detail={"code": "READ_FAILED", "message": str(e)})
 
     filename = key.rsplit("/", 1)[-1] if "/" in key else key
@@ -275,6 +292,13 @@ async def upload_audio_chunk(
     except Exception as e:
         error_str = str(e)
         logger.error(f"Chunk upload failed: {e}")
+        log_error(
+            e, db,
+            source="manual:upload_audio_chunk",
+            user_id=current_user.get("user_id"),
+            user_email=current_user.get("email"),
+            context={"meeting_id": meeting_id, "chunk_id": chunk_id, "s3_key": s3_key},
+        )
 
         # Check if it's an S3 AccessDenied error
         if "AccessDenied" in error_str:
@@ -363,6 +387,14 @@ async def merge_audio_chunks(
             merged_data.extend(data)
         except Exception as e:
             logger.error(f"Failed to read chunk {chunk['chunk_id']} for {meeting_id}: {e}")
+            log_error(
+                e, db,
+                source="manual:merge_audio_chunks_read",
+                user_id=current_user.get("user_id"),
+                user_email=current_user.get("email"),
+                context={"meeting_id": meeting_id, "chunk_id": chunk["chunk_id"]},
+                status_code=500,
+            )
             await db.meetings.update_one(
                 {"meeting_id": meeting_id},
                 {"$set": {
@@ -396,6 +428,14 @@ async def merge_audio_chunks(
     try:
         storage.upload_audio(bytes(merged_data), merged_key)
     except Exception as e:
+        log_error(
+            e, db,
+            source="manual:merge_audio_chunks_upload",
+            user_id=current_user.get("user_id"),
+            user_email=current_user.get("email"),
+            context={"meeting_id": meeting_id, "merged_key": merged_key},
+            status_code=500,
+        )
         await db.meetings.update_one(
             {"meeting_id": meeting_id},
             {"$set": {
@@ -424,8 +464,14 @@ async def merge_audio_chunks(
     for chunk in chunks:
         try:
             storage.delete_audio(chunk["s3_key"])
-        except Exception:
-            pass
+        except Exception as e:
+            log_error(
+                e, db,
+                source="manual:merge_audio_chunks_cleanup",
+                user_id=current_user.get("user_id"),
+                user_email=current_user.get("email"),
+                context={"meeting_id": meeting_id, "chunk_id": chunk.get("chunk_id"), "s3_key": chunk.get("s3_key")},
+            )
 
     await db.audio_chunks.delete_many({"meeting_id": meeting_id})
 
@@ -449,6 +495,13 @@ async def merge_audio_chunks(
         logger.info(f"Pushed meeting {meeting_id} to processing queue")
     except Exception as e:
         logger.error(f"Failed to push meeting {meeting_id} to processing queue: {e}")
+        log_error(
+            e, db,
+            source="manual:merge_audio_chunks_processing_queue_push",
+            user_id=current_user.get("user_id"),
+            user_email=current_user.get("email"),
+            context={"meeting_id": meeting_id},
+        )
 
     total_bytes = len(merged_data)
     logger.info(f"Merged {len(chunks)} chunks ({total_bytes} bytes) for meeting {meeting_id}")
@@ -490,6 +543,11 @@ async def _index_transcript_inline(meeting_id: str, user_id: str, transcript_tex
             )
         except Exception as e:
             logger.warning(f"Qdrant delete (pre-index) failed for {meeting_id}: {e}")
+            log_error(
+                e, sync_db,
+                source="manual:_index_transcript_inline_qdrant_pre_delete",
+                context={"meeting_id": meeting_id, "user_id": user_id},
+            )
 
         chunk_size = settings.chunk_size_tokens * 4
         overlap    = settings.chunk_overlap_tokens * 4
@@ -686,6 +744,13 @@ async def update_meeting(
         
         except Exception as e:
             logger.error("Failed to enqueue email for meeting %s: %s", meeting_id, e)
+            log_error(
+                e, db,
+                source="manual:update_meeting_email_enqueue",
+                user_id=current_user.get("user_id"),
+                user_email=current_user.get("email"),
+                context={"meeting_id": meeting_id},
+            )
 
     if "transcript" in update_data:
         transcript_text = update_data["transcript"].get("text", "").strip()
@@ -695,6 +760,13 @@ async def update_meeting(
                 result = await db.meetings.find_one({"meeting_id": meeting_id})
             except Exception as e:
                 logger.error(f"Inline RAG indexing failed for {meeting_id}: {e}")
+                log_error(
+                    e, db,
+                    source="manual:update_meeting_inline_rag_indexing",
+                    user_id=current_user.get("user_id"),
+                    user_email=current_user.get("email"),
+                    context={"meeting_id": meeting_id},
+                )
 
     return {"success": True, "data": serialize_meeting(result), "meta": {"updated_at": now.isoformat()}}
 
@@ -1029,6 +1101,14 @@ async def trigger_generation(
 
         except Exception as e:
             logger.error(f"Inline diagram generation failed for {meeting_id}: {e}")
+            log_error(
+                e, db,
+                source="manual:trigger_generation_diagram",
+                user_id=current_user.get("user_id"),
+                user_email=current_user.get("email"),
+                context={"meeting_id": meeting_id, "output_type": output_type},
+                status_code=500,
+            )
             failed_diagram = {
                 "status": "failed", "type": None, "mermaid_syntax": None,
                 "generated_at": None, "error": str(e),
@@ -1216,6 +1296,14 @@ async def trigger_generation(
         raise
     except Exception as e:
         logger.error(f"OpenAI call failed for {output_type} / {meeting_id}: {e}", exc_info=True)
+        log_error(
+            e, db,
+            source="manual:trigger_generation_openai_call",
+            user_id=current_user.get("user_id"),
+            user_email=current_user.get("email"),
+            context={"meeting_id": meeting_id, "output_type": output_type},
+            status_code=500,
+        )
         raise HTTPException(
             status_code=500,
             detail={"code": "GENERATION_FAILED", "message": str(e)},
@@ -1340,6 +1428,13 @@ async def download_audio(
         raise HTTPException(status_code=404, detail={"code": "AUDIO_NOT_FOUND",
             "message": f"Audio file not found: {audio_key}"})
     except Exception as e:
+        log_error(
+            e, db,
+            source="manual:download_audio",
+            user_id=tok_user_id,
+            context={"meeting_id": meeting_id, "audio_key": audio_key},
+            status_code=500,
+        )
         raise HTTPException(status_code=500, detail={"code": "READ_FAILED", "message": str(e)})
 
     filename = audio_key.rsplit("/", 1)[-1] if "/" in audio_key else audio_key
@@ -1382,6 +1477,13 @@ async def delete_meeting(
         get_storage().delete_audio(meeting["audio_s3_key"])
     except Exception as e:
         logger.warning(f"Could not delete audio for {meeting_id}: {e}")
+        log_error(
+            e, db,
+            source="manual:delete_meeting_audio_cleanup",
+            user_id=current_user.get("user_id"),
+            user_email=current_user.get("email"),
+            context={"meeting_id": meeting_id},
+        )
 
     await db.audio_chunks.delete_many({"meeting_id": meeting_id})
 
@@ -1393,5 +1495,12 @@ async def delete_meeting(
                       points_selector=Filter(must=[FieldCondition(key="meeting_id", match=MatchValue(value=meeting_id))]))
     except Exception as e:
         logger.warning(f"Failed to clean Qdrant vectors for {meeting_id}: {e}")
+        log_error(
+            e, db,
+            source="manual:delete_meeting_qdrant_cleanup",
+            user_id=current_user.get("user_id"),
+            user_email=current_user.get("email"),
+            context={"meeting_id": meeting_id},
+        )
 
     return {"success": True, "message": f"Meeting '{meeting_id}' deleted"}

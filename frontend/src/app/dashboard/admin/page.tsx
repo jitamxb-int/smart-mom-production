@@ -2112,9 +2112,225 @@ function TranscriptsPanel() {
 }
 
 
+// ─── Error Logs Panel ─────────────────────────────────────────────────────────
+
+interface ErrorLog {
+  id:                 string;
+  timestamp:          string;
+  exception_type:     string;
+  message:            string;
+  module:             string;
+  function:           string;
+  file_path:          string;
+  line_number:        number;
+  traceback:          string;
+  has_full_traceback?: boolean;
+  request_method:     string | null;
+  request_path:       string | null;
+  status_code:        number | null;
+  user_id:            string | null;
+  user_email:         string | null;
+  source:             string;
+  context:            Record<string, unknown>;
+}
+
+function ErrorLogDetailModal({ logId, onClose }: { logId: string; onClose: () => void }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ["admin-error-log-detail", logId],
+    queryFn: async () => {
+      const res = await adminApi.errorLogDetail(logId);
+      return res.data.data as ErrorLog;
+    },
+  });
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-xl p-6 max-w-3xl w-full max-h-[85vh] overflow-y-auto shadow-2xl">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold text-gray-800">Error Detail</h3>
+          <button onClick={onClose}>
+            <X className="h-5 w-5 text-gray-400 hover:text-gray-600" />
+          </button>
+        </div>
+        {isLoading || !data ? (
+          <div className="flex justify-center py-10">
+            <Loader2 className="h-6 w-6 animate-spin text-indigo-600" />
+          </div>
+        ) : (
+          <div className="space-y-3 text-sm">
+            <p><span className="font-medium">Type:</span> {data.exception_type} — {data.message}</p>
+            <p><span className="font-medium">Location:</span> {data.file_path}:{data.line_number} ({data.module}.{data.function})</p>
+            <p><span className="font-medium">Source:</span> {data.source}</p>
+            {data.request_path && (
+              <p><span className="font-medium">Request:</span> {data.request_method} {data.request_path} → {data.status_code ?? "—"}</p>
+            )}
+            {data.user_email && <p><span className="font-medium">User:</span> {data.user_email}</p>}
+            {data.context && Object.keys(data.context).length > 0 && (
+              <p><span className="font-medium">Context:</span> {JSON.stringify(data.context)}</p>
+            )}
+            <pre className="bg-gray-900 text-gray-100 text-xs p-4 rounded-lg overflow-x-auto whitespace-pre-wrap">{data.traceback}</pre>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ErrorLogsPanel() {
+  const queryClient = useQueryClient();
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState("");
+  const [moduleFilter, setModuleFilter] = useState("");
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const [confirmClear, setConfirmClear] = useState(false);
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["admin-error-logs", page, search, moduleFilter],
+    queryFn: async () => {
+      const res = await adminApi.errorLogs(page, 50, {
+        search: search || undefined,
+        module: moduleFilter || undefined,
+      });
+      return res.data as { data: ErrorLog[]; meta: { total: number } };
+    },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (logId: string) => adminApi.deleteErrorLog(logId),
+    onSuccess: () => {
+      toast.success("Error log deleted");
+      queryClient.invalidateQueries({ queryKey: ["admin-error-logs"] });
+    },
+    onError: (e: any) => toast.error(e.message || "Failed to delete error log"),
+  });
+
+  const clearMutation = useMutation({
+    mutationFn: () => adminApi.clearErrorLogs(),
+    onSuccess: () => {
+      toast.success("Error logs cleared");
+      queryClient.invalidateQueries({ queryKey: ["admin-error-logs"] });
+      setConfirmClear(false);
+    },
+    onError: (e: any) => toast.error(e.message || "Failed to clear logs"),
+  });
+
+  const logs = data?.data || [];
+  const total = data?.meta?.total || 0;
+
+  return (
+    <div>
+      {confirmClear && (
+        <ConfirmDialog
+          danger
+          message="Clear ALL captured error logs? This cannot be undone."
+          onConfirm={() => clearMutation.mutate()}
+          onCancel={() => setConfirmClear(false)}
+        />
+      )}
+      {detailId && <ErrorLogDetailModal logId={detailId} onClose={() => setDetailId(null)} />}
+
+      <div className="flex items-center gap-3 mb-4 flex-wrap">
+        <div className="relative flex-1 max-w-xs">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
+          <input
+            type="text" placeholder="Search message…" value={search}
+            onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+            className="w-full pl-9 pr-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-400"
+          />
+        </div>
+        <input
+          type="text" placeholder="Filter by module…" value={moduleFilter}
+          onChange={(e) => { setModuleFilter(e.target.value); setPage(1); }}
+          className="px-3 py-2 text-sm border border-gray-200 rounded-lg w-48"
+        />
+        <p className="text-sm text-gray-500">{total} total errors</p>
+        <button
+          onClick={() => setConfirmClear(true)}
+          className="ml-auto flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-red-600 border border-red-200 rounded-lg hover:bg-red-50"
+        >
+          <Trash2 className="h-3.5 w-3.5" /> Clear all
+        </button>
+      </div>
+
+      {isLoading ? (
+        <div className="flex items-center justify-center h-40">
+          <Loader2 className="h-6 w-6 animate-spin text-indigo-600" />
+        </div>
+      ) : (
+        <div className="overflow-x-auto rounded-xl border border-gray-200">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 border-b border-gray-200">
+              <tr>
+                <th className="text-left px-4 py-3 font-medium text-gray-600">Time</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-600">Location</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-600">Message</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-600">Source</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-600">Status</th>
+                <th className="text-right px-4 py-3 font-medium text-gray-600">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {logs.map((log) => (
+                <tr key={log.id} className="bg-white hover:bg-gray-50">
+                  <td className="px-4 py-3 text-gray-500 whitespace-nowrap">
+                    {log.timestamp ? format(new Date(log.timestamp), "MMM d, HH:mm:ss") : "—"}
+                  </td>
+                  <td className="px-4 py-3 text-gray-700">
+                    <p className="font-medium">{log.module}.{log.function}</p>
+                    <p className="text-xs text-gray-400">{log.file_path}:{log.line_number}</p>
+                  </td>
+                  <td className="px-4 py-3 text-gray-600 max-w-xs truncate" title={log.message}>
+                    {log.exception_type}: {log.message}
+                  </td>
+                  <td className="px-4 py-3">
+                    <span className="px-2 py-0.5 text-xs rounded-full bg-gray-100 text-gray-600">{log.source}</span>
+                  </td>
+                  <td className="px-4 py-3">{log.status_code ?? "—"}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        onClick={() => setDetailId(log.id)}
+                        title="View traceback"
+                        className="p-1.5 rounded hover:bg-gray-100 text-gray-500 hover:text-indigo-600"
+                      >
+                        <FileText className="h-4 w-4" />
+                      </button>
+                      <button
+                        onClick={() => deleteMutation.mutate(log.id)}
+                        title="Delete"
+                        className="p-1.5 rounded hover:bg-red-50 text-gray-400 hover:text-red-600"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {logs.length === 0 && <p className="text-center text-gray-400 py-8 text-sm">No errors captured</p>}
+        </div>
+      )}
+
+      {total > 50 && (
+        <div className="flex items-center justify-center gap-3 mt-4">
+          <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page === 1} className="p-1.5 rounded border disabled:opacity-40 hover:bg-gray-50">
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+          <span className="text-sm text-gray-600">Page {page}</span>
+          <button onClick={() => setPage((p) => p + 1)} disabled={logs.length < 50} className="p-1.5 rounded border disabled:opacity-40 hover:bg-gray-50">
+            <ChevronRight className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
-type AdminTab = "stats" | "users" | "system" | "indexing" | "transcripts";
+type AdminTab = "stats" | "users" | "system" | "indexing" | "transcripts" | "logs";
 
 export default function AdminPage() {
   const { data: session } = useSession() as any;
@@ -2148,6 +2364,7 @@ export default function AdminPage() {
             { key: "transcripts", label: "Transcripts", icon: FileText  },
             { key: "system",      label: "System",      icon: Settings  },
             { key: "indexing",    label: "RAG Index",   icon: Database  },
+            { key: "logs",        label: "Error Logs",  icon: AlertCircle },
           ] as { key: AdminTab; label: string; icon: any }[]
         ).map(({ key, label, icon: Icon }) => (
           <button
@@ -2171,6 +2388,7 @@ export default function AdminPage() {
       {tab === "transcripts" && <TranscriptsPanel />}
       {tab === "system"      && <><StorageConfigPanel /><BotSetupCard /></>}
       {tab === "indexing"    && <RagIndexingPanel />}
+      {tab === "logs"        && <ErrorLogsPanel />}
     </div>
   );
 }

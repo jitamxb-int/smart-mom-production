@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from typing import Optional
 from app.auth.jwt import require_admin
 from app.db.database import get_db
+from app.core.error_logger import log_error
 import logging
 
 logger = logging.getLogger(__name__)
@@ -127,6 +128,13 @@ async def delete_user(
             )
         except Exception as e:
             logger.warning(f"Failed to clean Qdrant vectors for deleted user {user_id}: {e}")
+            log_error(
+                e, db,
+                source="manual:delete_user_qdrant_cleanup",
+                user_id=current_user.get("user_id"),
+                user_email=current_user.get("email"),
+                context={"deleted_user_id": user_id, "meeting_count": len(meeting_ids)},
+            )
 
     return {
         "success": True,
@@ -304,6 +312,13 @@ async def index_all_unindexed_meetings(
             err_msg = f"{meeting_id}: {str(e)}"
             errors.append(err_msg)
             logger.error(f"Failed to index meeting {meeting_id}: {e}")
+            log_error(
+                e, db,
+                source="manual:index_all_unindexed_meetings",
+                user_id=current_user.get("user_id"),
+                user_email=current_user.get("email"),
+                context={"meeting_id": meeting_id, "owning_user_id": user_id},
+            )
 
     return {
         "success": True,
@@ -580,5 +595,121 @@ async def admin_delete_meeting(
         )
     except Exception as e:
         logger.warning(f"Failed to clean Qdrant vectors for {meeting_id}: {e}")
+        log_error(
+            e, db,
+            source="manual:admin_delete_meeting_qdrant_cleanup",
+            user_id=current_user.get("user_id"),
+            user_email=current_user.get("email"),
+            context={"meeting_id": meeting_id},
+        )
 
     return {"success": True, "message": f"Meeting '{meeting_id}' force-deleted by admin"}
+
+
+# ─── Error Logs ────────────────────────────────────────────────────────────────
+
+def _serialize_error_log(doc: dict, full: bool = False) -> dict:
+    doc["id"] = str(doc.pop("_id"))
+    if not full:
+        tb = doc.get("traceback", "")
+        doc["traceback"] = tb[:500]
+        doc["has_full_traceback"] = len(tb) > 500
+    return doc
+
+
+@router.get("/error-logs")
+async def list_error_logs(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    module: Optional[str] = Query(default=None),
+    source: Optional[str] = Query(default=None),
+    status_code: Optional[int] = Query(default=None),
+    search: Optional[str] = Query(default=None, description="Substring match against the error message"),
+    date_from: Optional[str] = Query(default=None, description="ISO date, inclusive"),
+    date_to: Optional[str] = Query(default=None, description="ISO date, inclusive"),
+    current_user: dict = Depends(require_admin),
+    db=Depends(get_db),
+):
+    """List captured error logs with pagination and filters."""
+    import re
+
+    query: dict = {}
+    if module:
+        query["module"] = module
+    if source:
+        query["source"] = {"$regex": f"^{re.escape(source)}"}
+    if status_code is not None:
+        query["status_code"] = status_code
+    if search:
+        query["message"] = {"$regex": re.escape(search), "$options": "i"}
+    if date_from or date_to:
+        rng = {}
+        if date_from:
+            rng["$gte"] = datetime.fromisoformat(date_from)
+        if date_to:
+            rng["$lte"] = datetime.fromisoformat(date_to)
+        query["timestamp"] = rng
+
+    skip = (page - 1) * limit
+    cursor = db.error_logs.find(query, sort=[("timestamp", -1)]).skip(skip).limit(limit)
+    logs = await cursor.to_list(length=limit)
+    total = await db.error_logs.count_documents(query)
+
+    return {
+        "success": True,
+        "data": [_serialize_error_log(l) for l in logs],
+        "meta": {"total": total, "page": page, "limit": limit},
+    }
+
+
+@router.get("/error-logs/{log_id}")
+async def get_error_log(
+    log_id: str,
+    current_user: dict = Depends(require_admin),
+    db=Depends(get_db),
+):
+    """Full detail for one error log, including the untruncated traceback."""
+    try:
+        oid = ObjectId(log_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail={"code": "INVALID_LOG_ID"})
+
+    doc = await db.error_logs.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail={"code": "LOG_NOT_FOUND"})
+
+    return {"success": True, "data": _serialize_error_log(doc, full=True)}
+
+
+@router.delete("/error-logs/{log_id}")
+async def delete_error_log(
+    log_id: str,
+    current_user: dict = Depends(require_admin),
+    db=Depends(get_db),
+):
+    """Delete a single error log entry."""
+    try:
+        oid = ObjectId(log_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail={"code": "INVALID_LOG_ID"})
+
+    result = await db.error_logs.delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail={"code": "LOG_NOT_FOUND"})
+
+    return {"success": True, "message": f"Error log {log_id} deleted"}
+
+
+@router.delete("/error-logs")
+async def clear_error_logs(
+    current_user: dict = Depends(require_admin),
+    db=Depends(get_db),
+):
+    """Bulk-clear all captured error logs (manual purge ahead of TTL)."""
+    result = await db.error_logs.delete_many({})
+    logger.info(f"Admin {current_user.get('email')} cleared {result.deleted_count} error logs")
+    return {
+        "success": True,
+        "message": f"{result.deleted_count} error logs cleared",
+        "deleted_count": result.deleted_count,
+    }

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from celery import shared_task
 from app.worker.celery_app import celery_app
 from app.core.config import settings
+from app.core.error_logger import log_error
 import logging
 
 logger = logging.getLogger(__name__)
@@ -210,6 +211,7 @@ def generate_diagram(self, meeting_id: str):
 
     except Exception as exc:
         logger.error(f"diagram_gen error for {meeting_id}: {exc}")
+        log_error(exc, db, source="manual:diagram_gen.generate_diagram", context={"meeting_id": meeting_id})
         try:
             db.meetings.update_one(
                 {"meeting_id": meeting_id},

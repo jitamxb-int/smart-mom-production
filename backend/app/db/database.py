@@ -101,6 +101,36 @@ async def connect_db():
     except OperationFailure:
         pass
 
+    # ── Error Logs collection (TTL) ─────────────────────────────────────────
+    try:
+        await db.error_logs.create_index(
+            "timestamp", expireAfterSeconds=settings.error_log_ttl_seconds
+        )
+    except OperationFailure as e:
+        if "IndexOptionsConflict" in str(e) or "already exists with different options" in str(e):
+            # MongoDB TTL indexes fix expireAfterSeconds at creation time — it
+            # can't be changed by re-running create_index. Reconcile via
+            # collMod instead, so changing ERROR_LOG_TTL_HOURS + restarting
+            # the backend actually takes effect.
+            try:
+                await db.command({
+                    "collMod": "error_logs",
+                    "index": {
+                        "keyPattern": {"timestamp": 1},
+                        "expireAfterSeconds": settings.error_log_ttl_seconds,
+                    },
+                })
+                logger.info(f"Reconciled error_logs TTL index to {settings.error_log_ttl_seconds}s")
+            except OperationFailure as ce:
+                logger.warning(f"Could not reconcile error_logs TTL index: {ce}")
+        else:
+            raise
+
+    try:
+        await db.error_logs.create_index([("module", 1), ("timestamp", -1)])
+    except OperationFailure:
+        pass
+
     logger.info("MongoDB indexes ensured")
 
 

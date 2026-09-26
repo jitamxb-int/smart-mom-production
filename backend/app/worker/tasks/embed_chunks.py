@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from celery import shared_task
 from app.worker.celery_app import celery_app
 from app.core.config import settings
+from app.core.error_logger import log_error
 import logging
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,11 @@ def embed_transcript(self, meeting_id: str):
             )
         except Exception as e:
             logger.warning(f"Could not delete existing Qdrant points: {e}")
+            log_error(
+                e, db,
+                source="manual:embed_chunks.embed_transcript_qdrant_cleanup",
+                context={"meeting_id": meeting_id},
+            )
 
         # Chunk text
         chunks = chunk_text(
@@ -165,4 +171,5 @@ def embed_transcript(self, meeting_id: str):
 
     except Exception as exc:
         logger.error(f"embed_transcript error for {meeting_id}: {exc}")
+        log_error(exc, db, source="manual:embed_chunks.embed_transcript", context={"meeting_id": meeting_id})
         raise self.retry(exc=exc, countdown=10)

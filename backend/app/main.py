@@ -94,6 +94,10 @@ async def preflight_handler(rest_of_path: str):
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
+
+    from app.core.error_logger import log_error
+    log_error(exc, get_db(), request=request, source="http_exception_handler", status_code=500)
+
     return JSONResponse(
         status_code=500,
         content={
