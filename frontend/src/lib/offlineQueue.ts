@@ -1,19 +1,25 @@
 /**
- * Offline recording queue.
+ * Offline recording metadata.
  *
- * Audio chunks and meeting details are kept in IndexedDB so a recording can
- * start (and survive a page reload) without a network connection. Once the
- * browser is online again the queued meeting is created on the backend, its
- * chunks are uploaded in order, and the usual merge flow runs.
+ * Only small sync records live in IndexedDB — the audio itself is written to
+ * the Origin Private File System (see `opfsChunks.ts`). A chunk record exists
+ * until its file has been uploaded, so the presence of a record means "not
+ * synced yet" and the `status` field tracks the last attempt.
  */
 
-export interface CachedChunk {
+export interface PendingChunk {
   meeting_id: string;
   chunk_id: number;
   timestamp: string;
-  blob: Blob;
   size_bytes: number;
-  mime_type?: string;
+  mime_type: string;
+  /** `uploaded` means the backend has the chunk but cleanup was interrupted. */
+  status: "pending" | "uploaded" | "failed";
+  /**
+   * Legacy field: earlier builds kept the audio blob in IndexedDB. New records
+   * never set this, but reading it keeps already-queued audio uploadable.
+   */
+  blob?: Blob;
 }
 
 export interface PendingMeeting {
@@ -76,29 +82,43 @@ async function withStore<T>(
   });
 }
 
-// ── Audio chunks ──────────────────────────────────────────────────────────────
+// ── Chunk sync records ────────────────────────────────────────────────────────
 
-export function cacheChunk(chunk: CachedChunk): Promise<IDBValidKey> {
+export function savePendingChunk(chunk: PendingChunk): Promise<IDBValidKey> {
   return withStore(CHUNK_STORE, "readwrite", (store) => store.put(chunk));
 }
 
-export function removeCachedChunk(meetingId: string, chunkId: number): Promise<undefined> {
+export function deletePendingChunk(meetingId: string, chunkId: number): Promise<undefined> {
   return withStore(CHUNK_STORE, "readwrite", (store) => store.delete([meetingId, chunkId]));
 }
 
-export function getPendingChunksForMeeting(meetingId: string): Promise<CachedChunk[]> {
+export function getPendingChunk(meetingId: string, chunkId: number): Promise<PendingChunk | undefined> {
+  return withStore(CHUNK_STORE, "readonly", (store) => store.get([meetingId, chunkId]));
+}
+
+export function getPendingChunksForMeeting(meetingId: string): Promise<PendingChunk[]> {
   return withStore(CHUNK_STORE, "readonly", (store) =>
-    store.index("meeting_id").getAll(IDBKeyRange.only(meetingId)) as IDBRequest<CachedChunk[]>,
+    store.index("meeting_id").getAll(IDBKeyRange.only(meetingId)) as IDBRequest<PendingChunk[]>,
   );
 }
 
-export function getAllPendingChunks(): Promise<CachedChunk[]> {
+export function getAllPendingChunks(): Promise<PendingChunk[]> {
   return withStore(CHUNK_STORE, "readonly", (store) =>
-    store.getAll() as IDBRequest<CachedChunk[]>,
+    store.getAll() as IDBRequest<PendingChunk[]>,
   );
 }
 
-// ── Meeting details ───────────────────────────────────────────────────────────
+export async function updatePendingChunkStatus(
+  meetingId: string,
+  chunkId: number,
+  status: PendingChunk["status"],
+): Promise<void> {
+  const chunk = await getPendingChunk(meetingId, chunkId);
+  if (!chunk) return;
+  await savePendingChunk({ ...chunk, status });
+}
+
+// ── Meeting records ───────────────────────────────────────────────────────────
 
 export function savePendingMeeting(meeting: PendingMeeting): Promise<IDBValidKey> {
   return withStore(MEETING_STORE, "readwrite", (store) => store.put(meeting));

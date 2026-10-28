@@ -8,8 +8,9 @@
  *    Promise set; merge only fires once every pending upload resolves.
  * 2. Correct API endpoint: POST /api/v1/meetings/{meeting_id}/chunks
  * 3. Full recording mode removed (commented block at bottom of file).
- * 4. Offline recording: meeting details and audio chunks are queued in
- *    IndexedDB and synced automatically when the browser reconnects.
+ * 4. Offline recording: audio chunks are queued in the Origin Private File
+ *    System (OPFS) with sync metadata in IndexedDB, then uploaded and merged
+ *    automatically when the browser reconnects.
  */
 
 import { useState, useRef, useCallback, useEffect } from "react";
@@ -20,11 +21,15 @@ import Link from "next/link";
 import { meetingsApi } from "@/lib/api";
 import { getCurrentISTISO } from "@/lib/dateUtils";
 import {
-  cacheChunk, removeCachedChunk, getPendingChunksForMeeting, getAllPendingChunks,
+  savePendingChunk, updatePendingChunkStatus, deletePendingChunk,
+  getPendingChunksForMeeting, getAllPendingChunks,
   savePendingMeeting, getPendingMeeting, markPendingMeetingCreated,
   deletePendingMeeting, getAllPendingMeetings,
-  type CachedChunk, type PendingMeeting,
+  type PendingChunk, type PendingMeeting,
 } from "@/lib/offlineQueue";
+import {
+  writeChunkFile, readChunkFile, deleteChunkFile, deleteMeetingChunks, isOpfsAvailable,
+} from "@/lib/opfsChunks";
 import { useAppSelector } from "@/store/hooks";
 import toast from "react-hot-toast";
 import {
@@ -46,7 +51,19 @@ interface ChunkStatus {
   size_bytes: number;
 }
 
-const CHUNK_INTERVAL_MS = parseInt(process.env.NEXT_PUBLIC_CHUNK_INTERVAL_MS || "30000", 10);
+/** Maximum audio duration per chunk, in seconds. */
+function getChunkDurationSeconds(): number {
+  const seconds = parseInt(process.env.NEXT_PUBLIC_CHUNK_DURATION_SECONDS || "", 10);
+  if (seconds > 0) return seconds;
+
+  // Backwards compatibility with the old millisecond setting.
+  const ms = parseInt(process.env.NEXT_PUBLIC_CHUNK_INTERVAL_MS || "", 10);
+  if (ms > 0) return Math.max(1, Math.round(ms / 1000));
+
+  return 30;
+}
+
+const CHUNK_DURATION_SECONDS = getChunkDurationSeconds();
 
 /** Axios network/timeout failures have no HTTP response attached. */
 function isNetworkError(err: any): boolean {
@@ -154,10 +171,11 @@ export function RecordClient(props: {
   const [formDone,       setFormDone]       = useState(false);
 
   const mrRef             = useRef<MediaRecorder | null>(null);
-  const chunkBlobRef      = useRef<Blob[]>([]);
-  const chunkIdRef        = useRef(0);
-  const chunkTimerRef     = useRef<ReturnType<typeof setInterval> | null>(null);
-  const elapsedTimerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const chunkBlobRef         = useRef<Blob[]>([]);
+  const chunkIdRef           = useRef(0);
+  const chunkStartElapsedRef = useRef(0);
+  const elapsedRef           = useRef(0);
+  const elapsedTimerRef      = useRef<ReturnType<typeof setInterval> | null>(null);
   const streamRef         = useRef<MediaStream | null>(null);
   const mimeTypeRef       = useRef("audio/webm");
   const isStoppingRef     = useRef(false);
@@ -188,7 +206,12 @@ export function RecordClient(props: {
     wakeLockRef.current = null;
   }, []);
 
-  const startET = () => { elapsedTimerRef.current = setInterval(() => setElapsed(e => e + 1), 1000); };
+  const startET = () => {
+    elapsedTimerRef.current = setInterval(() => {
+      elapsedRef.current += 1;
+      setElapsed(elapsedRef.current);
+    }, 1000);
+  };
   const stopET  = () => { if (elapsedTimerRef.current) { clearInterval(elapsedTimerRef.current); elapsedTimerRef.current = null; } };
 
   const checkGP = useCallback(async () => {
@@ -238,6 +261,30 @@ export function RecordClient(props: {
     }
   }, []);
 
+  /** Persists a chunk's audio to OPFS and its sync metadata to IndexedDB. */
+  const storeChunk = useCallback(async (
+    meetingId: string,
+    chunkId: number,
+    blob: Blob,
+    mimeType: string,
+  ) => {
+    await writeChunkFile(meetingId, chunkId, blob, mimeType);
+    try {
+      await savePendingChunk({
+        meeting_id: meetingId,
+        chunk_id:   chunkId,
+        timestamp:  new Date().toISOString(),
+        size_bytes: blob.size,
+        mime_type:  mimeType,
+        status:     "pending",
+      });
+    } catch (err) {
+      // Don't leave an orphan file behind if the metadata write fails.
+      await deleteChunkFile(meetingId, chunkId, mimeType);
+      throw err;
+    }
+  }, []);
+
   const retryCachedChunks = useCallback(async (meetingId: string): Promise<boolean> => {
     networkErrorRef.current = false;
     if (!navigator.onLine) return false;
@@ -253,7 +300,7 @@ export function RecordClient(props: {
       return false;
     }
 
-    let cached: CachedChunk[];
+    let cached: PendingChunk[];
     try { cached = await getPendingChunksForMeeting(meetingId); } catch { return false; }
     if (!cached.length) return true;
 
@@ -266,15 +313,38 @@ export function RecordClient(props: {
         else n.push({ chunk_id: c.chunk_id, status: "uploading", size_bytes: c.size_bytes });
         return n;
       });
+
+      const mimeType = c.mime_type || mimeTypeRef.current;
+
+      // A previous sync uploaded this chunk but was interrupted before cleanup.
+      if (c.status === "uploaded") {
+        if (!c.blob) await deleteChunkFile(meetingId, c.chunk_id, mimeType);
+        await deletePendingChunk(meetingId, c.chunk_id).catch(() => {});
+        setChunkStatuses(prev => prev.map(x => x.chunk_id === c.chunk_id ? { ...x, status: "done" } : x));
+        continue;
+      }
+
+      let blob: Blob;
       try {
-        await meetingsApi.uploadChunk(
-          meetingId, c.blob, c.chunk_id, false,
-          c.mime_type || mimeTypeRef.current, c.timestamp,
-        );
-        await removeCachedChunk(meetingId, c.chunk_id);
+        blob = c.blob ?? await readChunkFile(meetingId, c.chunk_id, mimeType);
+      } catch {
+        // Audio file is missing; keep the record so the meeting isn't merged
+        // with incomplete audio.
+        await updatePendingChunkStatus(meetingId, c.chunk_id, "failed").catch(() => {});
+        setChunkStatuses(prev => prev.map(x => x.chunk_id === c.chunk_id ? { ...x, status: "failed" } : x));
+        ok = false;
+        continue;
+      }
+
+      try {
+        await meetingsApi.uploadChunk(meetingId, blob, c.chunk_id, false, mimeType, c.timestamp);
+        await updatePendingChunkStatus(meetingId, c.chunk_id, "uploaded").catch(() => {});
+        if (!c.blob) await deleteChunkFile(meetingId, c.chunk_id, mimeType);
+        await deletePendingChunk(meetingId, c.chunk_id).catch(() => {});
         setChunkStatuses(prev => prev.map(x => x.chunk_id === c.chunk_id ? { ...x, status: "done" } : x));
       } catch (e: any) {
         if (isNetworkError(e)) networkErrorRef.current = true;
+        await updatePendingChunkStatus(meetingId, c.chunk_id, "failed").catch(() => {});
         setChunkStatuses(prev => prev.map(x => x.chunk_id === c.chunk_id ? { ...x, status: "cached" } : x));
         ok = false;
       }
@@ -284,7 +354,6 @@ export function RecordClient(props: {
 
   useEffect(() => () => {
     if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
-    if (chunkTimerRef.current)   clearInterval(chunkTimerRef.current);
     if (retryTimerRef.current)   clearInterval(retryTimerRef.current);
     streamRef.current?.getTracks().forEach(t => t.stop());
     releaseWakeLock();
@@ -308,7 +377,7 @@ export function RecordClient(props: {
     return () => document.removeEventListener("visibilitychange", onVis);
   }, [state, requestWakeLock]);
 
-  const uploadChunkBlob = useCallback((meetingId: string, chunkId: number, blob: Blob) => {
+  const uploadChunkBlob = useCallback((meetingId: string, chunkId: number, blob: Blob, mimeType: string) => {
     setChunkStatuses(prev => {
       const n = [...prev]; const i = n.findIndex(c => c.chunk_id === chunkId);
       if (i >= 0) n[i] = { ...n[i], status: "uploading" };
@@ -319,20 +388,24 @@ export function RecordClient(props: {
     const promise: Promise<void> = (async () => {
       if (!navigator.onLine) {
         try {
-          await cacheChunk({ meeting_id: meetingId, chunk_id: chunkId, timestamp: new Date().toISOString(), blob, size_bytes: blob.size, mime_type: mimeTypeRef.current });
+          await storeChunk(meetingId, chunkId, blob, mimeType);
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "cached" } : c));
         } catch {
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "failed" } : c));
         }
         return;
       }
+
       try {
-        await meetingsApi.uploadChunk(meetingId, blob, chunkId, false, mimeTypeRef.current);
+        await meetingsApi.uploadChunk(meetingId, blob, chunkId, false, mimeType);
         setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "done" } : c));
-        await removeCachedChunk(meetingId, chunkId).catch(() => {});
+        await deletePendingChunk(meetingId, chunkId).catch(() => {});
+        await deleteChunkFile(meetingId, chunkId, mimeType);
       } catch {
+        // The connection can drop between the online check and the request.
+        // Persist the chunk to OPFS and let the sync path upload it later.
         try {
-          await cacheChunk({ meeting_id: meetingId, chunk_id: chunkId, timestamp: new Date().toISOString(), blob, size_bytes: blob.size, mime_type: mimeTypeRef.current });
+          await storeChunk(meetingId, chunkId, blob, mimeType);
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "cached" } : c));
         } catch {
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "failed" } : c));
@@ -342,7 +415,7 @@ export function RecordClient(props: {
 
     pendingUploadsRef.current.add(promise);
     promise.finally(() => pendingUploadsRef.current.delete(promise));
-  }, []);
+  }, [storeChunk]);
 
   const retryAllPending = useCallback(async () => {
     if (!navigator.onLine || retryingRef.current || !accessToken) return;
@@ -351,7 +424,7 @@ export function RecordClient(props: {
     try {
       const all     = await getAllPendingChunks();
       const current = currentMeetingRef.current;
-      const byMeeting = new Map<string, CachedChunk[]>();
+      const byMeeting = new Map<string, PendingChunk[]>();
       for (const c of all) {
         if (c.meeting_id === current) continue; // still recording
         if (!byMeeting.has(c.meeting_id)) byMeeting.set(c.meeting_id, []);
@@ -375,13 +448,34 @@ export function RecordClient(props: {
         if (ok) {
           for (const c of chunks.sort((a, b) => a.chunk_id - b.chunk_id)) {
             if (!navigator.onLine) { ok = false; break; }
+
+            const mimeType = c.mime_type || mimeTypeRef.current;
+
+            // A previous sync uploaded this chunk but was interrupted before cleanup.
+            if (c.status === "uploaded") {
+              if (!c.blob) await deleteChunkFile(mid, c.chunk_id, mimeType);
+              await deletePendingChunk(mid, c.chunk_id).catch(() => {});
+              continue;
+            }
+
+            let blob: Blob;
             try {
-              await meetingsApi.uploadChunk(
-                mid, c.blob, c.chunk_id, false,
-                c.mime_type || mimeTypeRef.current, c.timestamp,
-              );
-              await removeCachedChunk(mid, c.chunk_id);
-            } catch { ok = false; }
+              blob = c.blob ?? await readChunkFile(mid, c.chunk_id, mimeType);
+            } catch {
+              await updatePendingChunkStatus(mid, c.chunk_id, "failed").catch(() => {});
+              ok = false;
+              break;
+            }
+
+            try {
+              await meetingsApi.uploadChunk(mid, blob, c.chunk_id, false, mimeType, c.timestamp);
+              await updatePendingChunkStatus(mid, c.chunk_id, "uploaded").catch(() => {});
+              if (!c.blob) await deleteChunkFile(mid, c.chunk_id, mimeType);
+              await deletePendingChunk(mid, c.chunk_id).catch(() => {});
+            } catch {
+              await updatePendingChunkStatus(mid, c.chunk_id, "failed").catch(() => {});
+              ok = false;
+            }
           }
         }
 
@@ -390,6 +484,7 @@ export function RecordClient(props: {
         try {
           await meetingsApi.mergeChunks(mid);
           await deletePendingMeeting(mid);
+          await deleteMeetingChunks(mid);
           if (mid === chunkMeetingId) {
             setPendingSync(false);
             setStatusMsg("Offline recording uploaded!");
@@ -411,12 +506,14 @@ export function RecordClient(props: {
 
         if (!m.created) {
           await deletePendingMeeting(m.meeting_id);
+          await deleteMeetingChunks(m.meeting_id);
           continue;
         }
 
         try {
           await meetingsApi.mergeChunks(m.meeting_id);
           await deletePendingMeeting(m.meeting_id);
+          await deleteMeetingChunks(m.meeting_id);
           if (m.meeting_id === chunkMeetingId) {
             setPendingSync(false);
             setStatusMsg("Offline recording uploaded!");
@@ -425,6 +522,7 @@ export function RecordClient(props: {
           // NO_CHUNKS means the merge already completed.
           if (e?.response?.data?.detail?.code === "NO_CHUNKS") {
             await deletePendingMeeting(m.meeting_id);
+            await deleteMeetingChunks(m.meeting_id);
           }
         }
       }
@@ -438,8 +536,32 @@ export function RecordClient(props: {
     }
   }, [accessToken, checkGP, ensureMeetingCreated, chunkMeetingId]);
 
+  const flushChunk = useCallback((meetingId: string, mimeType: string) => {
+    chunkStartElapsedRef.current = elapsedRef.current;
+    const blobs = [...chunkBlobRef.current]; chunkBlobRef.current = [];
+    if (!blobs.length) return;
+    const blob    = new Blob(blobs, { type: mimeType });
+    const chunkId = chunkIdRef.current++;
+    setChunkStatuses(prev => { if (prev.find(c => c.chunk_id === chunkId)) return prev; return [...prev, { chunk_id: chunkId, status: "pending", size_bytes: blob.size }]; });
+    uploadChunkBlob(meetingId, chunkId, blob, mimeType);
+  }, [uploadChunkBlob]);
+
+  // Start a new chunk once the configured maximum audio duration is reached.
   useEffect(() => {
-    const off = () => setIsOffline(true);
+    if (state !== "recording") return;
+    if (elapsed - chunkStartElapsedRef.current < CHUNK_DURATION_SECONDS) return;
+
+    const meetingId = currentMeetingRef.current;
+    if (meetingId) flushChunk(meetingId, mimeTypeRef.current);
+  }, [elapsed, state, flushChunk]);
+
+  useEffect(() => {
+    const off = () => {
+      setIsOffline(true);
+      // Flush the buffered audio immediately so a sudden disconnect doesn't
+      // have to wait for the next chunk boundary.
+      if (currentMeetingRef.current) flushChunk(currentMeetingRef.current, mimeTypeRef.current);
+    };
     const on  = () => {
       setIsOffline(false);
       if (currentMeetingRef.current) {
@@ -455,7 +577,7 @@ export function RecordClient(props: {
     window.addEventListener("offline", off); window.addEventListener("online", on);
     setIsOffline(!navigator.onLine);
     return () => { window.removeEventListener("offline", off); window.removeEventListener("online", on); };
-  }, [retryCachedChunks, retryAllPending, checkGP]);
+  }, [retryCachedChunks, retryAllPending, checkGP, flushChunk]);
 
   // On page load, upload anything queued while offline (e.g. the tab was closed
   // before the connection came back). Wait until the auth token is available.
@@ -463,15 +585,6 @@ export function RecordClient(props: {
     if (accessToken && navigator.onLine) retryAllPending();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accessToken]);
-
-  const flushChunk = useCallback((meetingId: string, mimeType: string) => {
-    const blobs = [...chunkBlobRef.current]; chunkBlobRef.current = [];
-    if (!blobs.length) return;
-    const blob    = new Blob(blobs, { type: mimeType });
-    const chunkId = chunkIdRef.current++;
-    setChunkStatuses(prev => { if (prev.find(c => c.chunk_id === chunkId)) return prev; return [...prev, { chunk_id: chunkId, status: "pending", size_bytes: blob.size }]; });
-    uploadChunkBlob(meetingId, chunkId, blob);
-  }, [uploadChunkBlob]);
 
   const triggerMerge = useCallback(async (meetingId: string) => {
     try {
@@ -514,6 +627,7 @@ export function RecordClient(props: {
 
       await meetingsApi.mergeChunks(meetingId);
       await deletePendingMeeting(meetingId);
+      await deleteMeetingChunks(meetingId);
 
       setPendingSync(false);
       setStatusMsg("Done!");
@@ -564,6 +678,10 @@ export function RecordClient(props: {
       created_at:    new Date().toISOString(),
     };
     const wantsBot = !!details.meet_url;
+
+    if (!isOpfsAvailable()) {
+      toast.error("Offline audio storage isn't available in this browser. Keep the connection on while recording.");
+    }
 
     // Bot-assisted recording needs the backend and the bot worker.
     if (wantsBot && !navigator.onLine) {
@@ -619,6 +737,13 @@ export function RecordClient(props: {
     }
 
     if (!created) {
+      if (!isOpfsAvailable()) {
+        setError("Offline recording isn't supported in this browser. Reconnect to record.");
+        currentMeetingRef.current = null;
+        setChunkMeetingId(null);
+        setState("idle");
+        return;
+      }
       try {
         await savePendingMeeting(details);
       } catch {
@@ -665,9 +790,9 @@ export function RecordClient(props: {
         triggerMerge(meetingId);
       };
 
-      chunkTimerRef.current  = setInterval(() => flushChunk(meetingId, mimeType), CHUNK_INTERVAL_MS);
       retryTimerRef.current  = setInterval(() => { if (navigator.onLine) retryCachedChunks(meetingId); }, 15_000);
       mr.start(1000);
+      elapsedRef.current = 0; chunkStartElapsedRef.current = 0;
       setState("recording"); setElapsed(0); startET();
     } catch (err: any) {
       const isDenied = err?.name === "NotAllowedError" || err?.name === "PermissionDeniedError";
@@ -675,6 +800,7 @@ export function RecordClient(props: {
       setError(isDenied ? "Microphone access denied. Allow access in browser settings." : noDevice ? "No microphone found. Connect a microphone and try again." : `Could not start: ${err?.message || "Unknown error"}`);
       if (!created) {
         deletePendingMeeting(meetingId).catch(() => {});
+        deleteMeetingChunks(meetingId).catch(() => {});
         currentMeetingRef.current = null;
       }
       setState("idle");
@@ -685,14 +811,12 @@ export function RecordClient(props: {
     const mr = mrRef.current; if (!mr) return;
     if (mr.state === "recording") {
       mr.pause(); stopET();
-      if (chunkTimerRef.current) { clearInterval(chunkTimerRef.current); chunkTimerRef.current = null; }
       setState("paused");
     } else if (mr.state === "paused") {
       mr.resume(); startET();
-      if (chunkMeetingId) { const mid = chunkMeetingId, mt = mimeTypeRef.current; chunkTimerRef.current = setInterval(() => flushChunk(mid, mt), CHUNK_INTERVAL_MS); }
       setState("recording");
     }
-  }, [chunkMeetingId, flushChunk]);
+  }, []);
 
   const stopRecording = useCallback(async () => {
     if (isBotRef.current) {
@@ -713,12 +837,12 @@ export function RecordClient(props: {
     const mr = mrRef.current;
     if (!mr || (mr.state !== "recording" && mr.state !== "paused")) return;
     isStoppingRef.current = true; stopET();
-    if (chunkTimerRef.current) { clearInterval(chunkTimerRef.current); chunkTimerRef.current = null; }
     if (retryTimerRef.current) { clearInterval(retryTimerRef.current); retryTimerRef.current = null; }
     mr.stop();
   }, [router, isSimpleUser]);
 
   const resetForm = useCallback(() => {
+    elapsedRef.current = 0; chunkStartElapsedRef.current = 0;
     setElapsed(0); setError(""); setStatusMsg(""); setChunkStatuses([]);
     setChunkMeetingId(null); setNovncUrl(null); setPendingSync(false);
     // Both admin and normal users must manually fill the form for each recording
@@ -1046,7 +1170,7 @@ export function RecordClient(props: {
                   <span className={`w-2 h-2 rounded-full ${state === "recording" ? "bg-red-400 animate-pulse" : state === "paused" ? "bg-amber-400" : "bg-white/30"}`} />
                   <p className="text-white/80 text-sm">
                     {state === "idle"      && (formDone ? "Ready · click Start Recording" : "Fill in meeting details below")}
-                    {state === "recording" && (isBotRef.current ? (statusMsg || "Bot recording …") : "Recording · uploading every 30 s")}
+                    {state === "recording" && (isBotRef.current ? (statusMsg || "Bot recording …") : `Recording · uploading every ${CHUNK_DURATION_SECONDS} s`)}
                     {state === "paused"    && "Paused"}
                     {state === "error"     && "Error — see below"}
                   </p>
@@ -1054,7 +1178,7 @@ export function RecordClient(props: {
                 {isActive && !isBotRef.current && (
                   <div className={`flex items-center gap-1.5 text-xs px-3 py-1 rounded-full ${isOffline ? "bg-amber-500/30 text-amber-200" : "bg-green-500/30 text-green-200"}`}>
                     {isOffline ? <WifiOff className="h-3 w-3" /> : <Wifi className="h-3 w-3" />}
-                    {isOffline ? "Offline — caching locally" : "Online — uploading every 30 s"}
+                    {isOffline ? "Offline — caching locally" : `Online — uploading every ${CHUNK_DURATION_SECONDS} s`}
                   </div>
                 )}
                 {isBotRef.current && state === "recording" && novncUrl && (
@@ -1125,7 +1249,7 @@ export function RecordClient(props: {
             <div className="p-6 space-y-5">
               <div className="flex items-start gap-2 p-3 bg-violet-50 border border-violet-200 rounded-xl text-xs text-violet-800">
                 <Layers className="h-3.5 w-3.5 flex-shrink-0 mt-0.5" />
-                <span>Fill in the meeting details, then click <strong>Continue</strong>. Audio uploads every <strong>30 seconds</strong> — cached locally if offline.</span>
+                <span>Fill in the meeting details, then click <strong>Continue</strong>. Audio uploads every <strong>{CHUNK_DURATION_SECONDS} seconds</strong> — cached locally if offline.</span>
               </div>
               <MetaForm meta={meta} onChange={setMeta} disabled={false} metaError={metaError} />
               <button onClick={submitForm}
@@ -1159,7 +1283,7 @@ export function RecordClient(props: {
             <ul className="space-y-1 text-xs text-gray-500 list-disc list-inside">
               <li>Fill in meeting details first, then click Continue</li>
               <li>Paste a Google Meet URL to have the bot join and record automatically</li>
-              <li>Without a Meet URL, audio records from your microphone and uploads every <strong>30 seconds</strong></li>
+              <li>Without a Meet URL, audio records from your microphone and uploads every <strong>{CHUNK_DURATION_SECONDS} seconds</strong></li>
               <li>Recording works offline — audio is saved on this device and uploaded when you reconnect</li>
               <li>Click Stop when done — all chunks are merged automatically</li>
             </ul>
