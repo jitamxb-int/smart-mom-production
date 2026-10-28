@@ -88,9 +88,11 @@ function validateMeta(meta: MeetingMeta, setError: (e: string) => void): boolean
   setError(""); return true;
 }
 
-function MetaForm({ meta, onChange, disabled, metaError }: {
+function MetaForm({ meta, onChange, disabled, metaError, audioDevices, selectedDeviceId, onDeviceChange }: {
   meta: MeetingMeta; onChange: (m: MeetingMeta) => void;
   disabled: boolean; metaError: string;
+  audioDevices: MediaDeviceInfo[]; selectedDeviceId: string;
+  onDeviceChange: (deviceId: string) => void;
 }) {
   return (
     <div className="space-y-3">
@@ -123,6 +125,24 @@ function MetaForm({ meta, onChange, disabled, metaError }: {
         <input type="number" min={1} value={meta.no_of_persons} disabled={disabled}
           onChange={e => onChange({ ...meta, no_of_persons: e.target.value })}
           className="w-28 border border-gray-200 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:bg-gray-50 disabled:text-gray-400 transition-colors" />
+      </div>
+      <div>
+        <label className="block text-xs font-semibold text-gray-600 mb-1.5">
+          Microphone <span className="text-gray-400 font-normal">(used for local recording)</span>
+        </label>
+        <select
+          value={selectedDeviceId}
+          disabled={disabled || audioDevices.length === 0}
+          onChange={e => onDeviceChange(e.target.value)}
+          className="w-full border border-gray-200 rounded-xl px-3.5 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:bg-gray-50 disabled:text-gray-400 transition-colors"
+        >
+          {audioDevices.length === 0 && <option value="">No microphone detected</option>}
+          {audioDevices.map((device, index) => (
+            <option key={device.deviceId || `mic-${index}`} value={device.deviceId}>
+              {device.label || `Microphone ${index + 1}`}
+            </option>
+          ))}
+        </select>
       </div>
       <div>
         <label className="block text-xs font-semibold text-gray-600 mb-1.5">
@@ -169,6 +189,8 @@ export function RecordClient(props: {
   const [meta,           setMeta]           = useState<MeetingMeta>({ context: "", attendees: "", no_of_persons: "", meet_url: "" });
   const [metaError,      setMetaError]      = useState("");
   const [formDone,       setFormDone]       = useState(false);
+  const [audioDevices,   setAudioDevices]   = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState("");
 
   const mrRef             = useRef<MediaRecorder | null>(null);
   const chunkBlobRef         = useRef<Blob[]>([]);
@@ -223,6 +245,30 @@ export function RecordClient(props: {
   }, []);
 
   useEffect(() => { checkGP(); const t = setInterval(checkGP, 10_000); return () => clearInterval(t); }, [checkGP]);
+
+  const refreshAudioDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const inputs  = devices.filter(d => d.kind === "audioinput");
+      setAudioDevices(inputs);
+      // Keep the current choice when it still exists, otherwise pick the first.
+      setSelectedDeviceId(prev => {
+        if (prev && inputs.some(d => d.deviceId === prev)) return prev;
+        return inputs[0]?.deviceId ?? "";
+      });
+    } catch {
+      // Enumeration is best-effort; recording still falls back to the default device.
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshAudioDevices();
+    const md = navigator.mediaDevices;
+    if (!md?.addEventListener) return;
+    md.addEventListener("devicechange", refreshAudioDevices);
+    return () => md.removeEventListener("devicechange", refreshAudioDevices);
+  }, [refreshAudioDevices]);
 
   /**
    * Creates the backend meeting record for a recording that was started while
@@ -773,8 +819,29 @@ export function RecordClient(props: {
 
     // Normal mic recording flow
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const audioConstraint: MediaTrackConstraints | boolean = selectedDeviceId
+        ? { deviceId: { exact: selectedDeviceId } }
+        : true;
+
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint, video: false });
+      } catch (err: any) {
+        // The chosen device may have been unplugged between selection and start.
+        if (selectedDeviceId && (err?.name === "OverconstrainedError" || err?.name === "NotFoundError")) {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        } else {
+          throw err;
+        }
+      }
+
       streamRef.current = stream;
+
+      // Device labels only become available after microphone permission is granted.
+      const actualDeviceId = stream.getAudioTracks()[0]?.getSettings().deviceId;
+      if (actualDeviceId) setSelectedDeviceId(actualDeviceId);
+      refreshAudioDevices();
+
       const mimeType = getMimeType(); mimeTypeRef.current = mimeType;
       const mr = new MediaRecorder(stream, { mimeType }); mrRef.current = mr;
       chunkBlobRef.current = [];
@@ -805,7 +872,7 @@ export function RecordClient(props: {
       }
       setState("idle");
     }
-  }, [formDone, meta, flushChunk, retryCachedChunks, triggerMerge]);
+  }, [formDone, meta, flushChunk, retryCachedChunks, triggerMerge, selectedDeviceId, refreshAudioDevices]);
 
   const togglePause = useCallback(() => {
     const mr = mrRef.current; if (!mr) return;
@@ -1021,7 +1088,7 @@ export function RecordClient(props: {
               {state === "idle" && !formDone ? (
                 <div className="w-full mt-6 text-left self-start">
                   <div className="space-y-4">
-                    <MetaForm meta={meta} onChange={setMeta} disabled={false} metaError={metaError} />
+                    <MetaForm meta={meta} onChange={setMeta} disabled={false} metaError={metaError} audioDevices={audioDevices} selectedDeviceId={selectedDeviceId} onDeviceChange={setSelectedDeviceId} />
                     <button
                       onClick={submitForm}
                       className="w-full flex items-center justify-center gap-2 px-6 py-3.5 bg-violet-600 hover:bg-violet-700 text-white rounded-2xl font-semibold transition-colors shadow-sm"
@@ -1251,7 +1318,7 @@ export function RecordClient(props: {
                 <Layers className="h-3.5 w-3.5 flex-shrink-0 mt-0.5" />
                 <span>Fill in the meeting details, then click <strong>Continue</strong>. Audio uploads every <strong>{CHUNK_DURATION_SECONDS} seconds</strong> — cached locally if offline.</span>
               </div>
-              <MetaForm meta={meta} onChange={setMeta} disabled={false} metaError={metaError} />
+              <MetaForm meta={meta} onChange={setMeta} disabled={false} metaError={metaError} audioDevices={audioDevices} selectedDeviceId={selectedDeviceId} onDeviceChange={setSelectedDeviceId} />
               <button onClick={submitForm}
                 className="w-full flex items-center justify-center gap-2 py-3 bg-violet-600 text-white rounded-xl font-medium hover:bg-violet-700 transition-colors shadow-sm">
                 Continue <ArrowRight className="h-4 w-4" />
