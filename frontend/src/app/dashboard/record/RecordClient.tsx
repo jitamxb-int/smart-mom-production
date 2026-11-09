@@ -210,6 +210,7 @@ export function RecordClient(props: {
   const creatingRef       = useRef<Map<string, Promise<void>>>(new Map());
   const retryingRef       = useRef(false);
   const networkErrorRef   = useRef(false);
+  const networkDownRef    = useRef(false);
   const wakeLockRef = useRef<any>(null);
 
   const requestWakeLock = useCallback(async () => {
@@ -281,6 +282,7 @@ export function RecordClient(props: {
 
     const task = (async () => {
       const { data } = await meetingsApi.presignedUpload(details.meeting_id);
+      alert(`Presigned Upload: ${data}`)
       try {
         await meetingsApi.create({
           meeting_id:    details.meeting_id,
@@ -292,7 +294,9 @@ export function RecordClient(props: {
           audio_state:   "chunked",
           meet_link:     details.meet_url || undefined,
         });
+        alert(`Meeting creation done`)
       } catch (e: any) {
+        alert(`Meeting creation error: ${JSON.stringify(e)}`)
         // Another tab/sync already created it — that's fine.
         if (e?.response?.status !== 409) throw e;
       }
@@ -342,7 +346,12 @@ export function RecordClient(props: {
         await ensureMeetingCreated(pendingMeeting);
       }
     } catch (e: any) {
-      networkErrorRef.current = isNetworkError(e);
+      const networkErr = isNetworkError(e);
+      networkErrorRef.current = networkErr || e?.response?.status === 401;
+      if (networkErr) {
+        networkDownRef.current = true;
+        setIsOffline(true);
+      }
       return false;
     }
 
@@ -387,12 +396,20 @@ export function RecordClient(props: {
         await updatePendingChunkStatus(meetingId, c.chunk_id, "uploaded").catch(() => {});
         if (!c.blob) await deleteChunkFile(meetingId, c.chunk_id, mimeType);
         await deletePendingChunk(meetingId, c.chunk_id).catch(() => {});
+        networkDownRef.current = false;
+        setIsOffline(false);
         setChunkStatuses(prev => prev.map(x => x.chunk_id === c.chunk_id ? { ...x, status: "done" } : x));
       } catch (e: any) {
-        if (isNetworkError(e)) networkErrorRef.current = true;
+        const networkErr = isNetworkError(e);
+        if (networkErr || e?.response?.status === 401) networkErrorRef.current = true;
+        if (networkErr) {
+          networkDownRef.current = true;
+          setIsOffline(true);
+        }
         await updatePendingChunkStatus(meetingId, c.chunk_id, "failed").catch(() => {});
         setChunkStatuses(prev => prev.map(x => x.chunk_id === c.chunk_id ? { ...x, status: "cached" } : x));
         ok = false;
+        if (networkErr) break;
       }
     }
     return ok;
@@ -432,7 +449,9 @@ export function RecordClient(props: {
     });
 
     const promise: Promise<void> = (async () => {
-      if (!navigator.onLine) {
+      // If the browser is offline, or a recent request failed with a network
+      // error, persist locally without attempting another network call.
+      if (!navigator.onLine || networkDownRef.current) {
         try {
           await storeChunk(meetingId, chunkId, blob, mimeType);
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "cached" } : c));
@@ -444,12 +463,20 @@ export function RecordClient(props: {
 
       try {
         await meetingsApi.uploadChunk(meetingId, blob, chunkId, false, mimeType);
+        networkDownRef.current = false;
+        setIsOffline(false);
         setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "done" } : c));
         await deletePendingChunk(meetingId, chunkId).catch(() => {});
         await deleteChunkFile(meetingId, chunkId, mimeType);
-      } catch {
-        // The connection can drop between the online check and the request.
-        // Persist the chunk to OPFS and let the sync path upload it later.
+      } catch (err: any) {
+        alert(`Error: ${JSON.stringify(err)}`)
+        // A timeout or a network failure means we're effectively offline even
+        // when navigator.onLine still reports true.
+        if (isNetworkError(err) || err?.code === "ECONNABORTED") {
+          networkDownRef.current = true;
+          setIsOffline(true);
+        }
+
         try {
           await storeChunk(meetingId, chunkId, blob, mimeType);
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "cached" } : c));
@@ -487,7 +514,11 @@ export function RecordClient(props: {
           if (pendingMeeting && !pendingMeeting.created) {
             await ensureMeetingCreated(pendingMeeting);
           }
-        } catch {
+        } catch (e: any) {
+          if (isNetworkError(e)) {
+            networkDownRef.current = true;
+            setIsOffline(true);
+          }
           ok = false;
         }
 
@@ -518,19 +549,28 @@ export function RecordClient(props: {
               await updatePendingChunkStatus(mid, c.chunk_id, "uploaded").catch(() => {});
               if (!c.blob) await deleteChunkFile(mid, c.chunk_id, mimeType);
               await deletePendingChunk(mid, c.chunk_id).catch(() => {});
-            } catch {
+            } catch (e: any) {
+              if (isNetworkError(e)) {
+                networkDownRef.current = true;
+                setIsOffline(true);
+              }
               await updatePendingChunkStatus(mid, c.chunk_id, "failed").catch(() => {});
               ok = false;
             }
           }
         }
 
-        if (!ok || !navigator.onLine) continue;
+        if (!ok || !navigator.onLine) {
+          if (networkDownRef.current) break;
+          continue;
+        }
 
         try {
           await meetingsApi.mergeChunks(mid);
           await deletePendingMeeting(mid);
           await deleteMeetingChunks(mid);
+          networkDownRef.current = false;
+          setIsOffline(false);
           if (mid === chunkMeetingId) {
             setPendingSync(false);
             setStatusMsg("Offline recording uploaded!");
@@ -538,6 +578,10 @@ export function RecordClient(props: {
             toast.success(`Meeting ${mid.slice(-8)} merged`);
           }
         } catch (e: any) {
+          if (isNetworkError(e)) {
+            networkDownRef.current = true;
+            setIsOffline(true);
+          }
           toast.error(`Merge failed: ${e?.message || "unknown error"}`);
         }
       }
@@ -603,12 +647,14 @@ export function RecordClient(props: {
 
   useEffect(() => {
     const off = () => {
+      networkDownRef.current = true;
       setIsOffline(true);
       // Flush the buffered audio immediately so a sudden disconnect doesn't
       // have to wait for the next chunk boundary.
       if (currentMeetingRef.current) flushChunk(currentMeetingRef.current, mimeTypeRef.current);
     };
     const on  = () => {
+      networkDownRef.current = false;
       setIsOffline(false);
       if (currentMeetingRef.current) {
         // Still recording: create the record if needed and drain cached chunks,
@@ -621,9 +667,55 @@ export function RecordClient(props: {
       checkGP();
     };
     window.addEventListener("offline", off); window.addEventListener("online", on);
+    networkDownRef.current = !navigator.onLine;
     setIsOffline(!navigator.onLine);
     return () => { window.removeEventListener("offline", off); window.removeEventListener("online", on); };
   }, [retryCachedChunks, retryAllPending, checkGP, flushChunk]);
+
+  useEffect(() => {
+    const retry = () => {
+      if (!navigator.onLine) return;
+
+      const meetingId = currentMeetingRef.current;
+
+      if (meetingId) {
+        void retryCachedChunks(meetingId);
+      } else {
+        void retryAllPending();
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        retry();
+      }
+    };
+
+    window.addEventListener("online", retry);
+    window.addEventListener("focus", retry);
+    window.addEventListener("pageshow", retry);
+    document.addEventListener(
+      "visibilitychange",
+      onVisibilityChange
+    );
+
+    // Mobile browsers do not always fire `online` reliably. Retry queued
+    // meetings periodically while the app is open.
+    const interval = setInterval(() => {
+      if (!currentMeetingRef.current) retry();
+    }, 30_000);
+
+    return () => {
+      window.removeEventListener("online", retry);
+      window.removeEventListener("focus", retry);
+      window.removeEventListener("pageshow", retry);
+      document.removeEventListener(
+        "visibilitychange",
+        onVisibilityChange
+      );
+      clearInterval(interval);
+    };
+  }, [retryCachedChunks, retryAllPending]);
 
   // On page load, upload anything queued while offline (e.g. the tab was closed
   // before the connection came back). Wait until the auth token is available.
@@ -684,7 +776,9 @@ export function RecordClient(props: {
       }
     } catch (e: any) {
       // The connection may have dropped between the uploads and the merge.
-      if (!navigator.onLine || isNetworkError(e)) {
+      // A 401 means the session expired; keep the audio queued for after the
+      // user signs in again.
+      if (!navigator.onLine || isNetworkError(e) || e?.response?.status === 401) {
         setPendingSync(true);
         setStatusMsg("Recording saved on this device — it will upload when you're back online.");
         setState("done");
@@ -730,79 +824,25 @@ export function RecordClient(props: {
     }
 
     // Bot-assisted recording needs the backend and the bot worker.
-    if (wantsBot && !navigator.onLine) {
-      setError("Bot-assisted recording needs an internet connection. Remove the Meet URL to record from your microphone offline.");
-      currentMeetingRef.current = null;
-      setChunkMeetingId(null);
-      setState("idle");
-      return;
-    }
-
-    // Create the meeting record up front when possible. If we're offline (or
-    // the network drops), the details are stored locally and created later.
-    let created = false;
-    if (navigator.onLine) {
-      let presignedInfo: any;
-      try {
-        const { data } = await meetingsApi.presignedUpload(meetingId);
-        presignedInfo = data;
-      } catch (e: any) {
-        if (!navigator.onLine || isNetworkError(e)) {
-          // Fall through to offline mode.
-        } else {
-          setError(e?.response?.data?.detail?.message || e?.message || "Failed to initialise session.");
-          currentMeetingRef.current = null;
-          setChunkMeetingId(null);
-          setState("idle");
-          return;
-        }
-      }
-
-      if (presignedInfo) {
-        try {
-          await meetingsApi.create({
-            meeting_id: meetingId, attendees: attendeeList,
-            context: details.context, no_of_persons: details.no_of_persons,
-            date_time: details.date_time,
-            audio_s3_key: presignedInfo.audio_s3_key, audio_state: "chunked",
-            meet_link: details.meet_url,
-          });
-          created = true;
-        } catch (e: any) {
-          if (!navigator.onLine || isNetworkError(e)) {
-            // Fall through to offline mode.
-          } else {
-            setError(e?.response?.data?.detail?.message || e?.message || "Failed to create meeting record.");
-            currentMeetingRef.current = null;
-            setChunkMeetingId(null);
-            setState("idle");
-            return;
-          }
-        }
-      }
-    }
-
-    if (!created) {
-      if (!isOpfsAvailable()) {
-        setError("Offline recording isn't supported in this browser. Reconnect to record.");
-        currentMeetingRef.current = null;
-        setChunkMeetingId(null);
-        setState("idle");
-        return;
-      }
-      try {
-        await savePendingMeeting(details);
-      } catch {
-        setError("Could not save the meeting details on this device. Check available storage and try again.");
-        currentMeetingRef.current = null;
-        setChunkMeetingId(null);
-        setState("idle");
-        return;
-      }
-    }
-
-    // Bot recording flow
     if (wantsBot) {
+      if (!navigator.onLine || networkDownRef.current) {
+        setError("Bot-assisted recording needs an internet connection. Remove the Meet URL to record from your microphone offline.");
+        currentMeetingRef.current = null;
+        setChunkMeetingId(null);
+        setState("idle");
+        return;
+      }
+
+      try {
+        await ensureMeetingCreated(details);
+      } catch (e: any) {
+        setError(e?.response?.data?.detail?.message || e?.message || "Failed to create meeting record.");
+        currentMeetingRef.current = null;
+        setChunkMeetingId(null);
+        setState("idle");
+        return;
+      }
+
       isBotRef.current = true;
       try {
         setState("recording");
@@ -814,6 +854,27 @@ export function RecordClient(props: {
         setError(e?.response?.data?.detail?.message || e?.message || "Failed to start bot recording.");
         setState("error");
       }
+      return;
+    }
+
+    // Microphone flow: save the details locally, start recording immediately,
+    // and create the backend record in the background. Offline / expired-token
+    // failures therefore never block the recording.
+    if (!isOpfsAvailable()) {
+      setError("Offline recording isn't supported in this browser. Reconnect to record.");
+      currentMeetingRef.current = null;
+      setChunkMeetingId(null);
+      setState("idle");
+      return;
+    }
+
+    try {
+      await savePendingMeeting(details);
+    } catch {
+      setError("Could not save the meeting details on this device. Check available storage and try again.");
+      currentMeetingRef.current = null;
+      setChunkMeetingId(null);
+      setState("idle");
       return;
     }
 
@@ -857,22 +918,31 @@ export function RecordClient(props: {
         triggerMerge(meetingId);
       };
 
-      retryTimerRef.current  = setInterval(() => { if (navigator.onLine) retryCachedChunks(meetingId); }, 15_000);
+      retryTimerRef.current = setInterval(() => {
+        if (navigator.onLine) retryCachedChunks(meetingId);
+      }, 15_000);
       mr.start(1000);
       elapsedRef.current = 0; chunkStartElapsedRef.current = 0;
       setState("recording"); setElapsed(0); startET();
+
+      // Create the backend record after recording has started. If this fails
+      // (offline, expired token, server error) the local queue handles it.
+      if (navigator.onLine && !networkDownRef.current) {
+        void ensureMeetingCreated(details).catch(() => {});
+      }
     } catch (err: any) {
       const isDenied = err?.name === "NotAllowedError" || err?.name === "PermissionDeniedError";
       const noDevice = err?.name === "NotFoundError"   || err?.name === "DevicesNotFoundError";
       setError(isDenied ? "Microphone access denied. Allow access in browser settings." : noDevice ? "No microphone found. Connect a microphone and try again." : `Could not start: ${err?.message || "Unknown error"}`);
-      if (!created) {
-        deletePendingMeeting(meetingId).catch(() => {});
-        deleteMeetingChunks(meetingId).catch(() => {});
-        currentMeetingRef.current = null;
-      }
+      if (retryTimerRef.current) { clearInterval(retryTimerRef.current); retryTimerRef.current = null; }
+      streamRef.current?.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+      deletePendingMeeting(meetingId).catch(() => {});
+      deleteMeetingChunks(meetingId).catch(() => {});
+      currentMeetingRef.current = null;
       setState("idle");
     }
-  }, [formDone, meta, flushChunk, retryCachedChunks, triggerMerge, selectedDeviceId, refreshAudioDevices]);
+  }, [formDone, meta, flushChunk, retryCachedChunks, triggerMerge, selectedDeviceId, refreshAudioDevices, ensureMeetingCreated]);
 
   const togglePause = useCallback(() => {
     const mr = mrRef.current; if (!mr) return;
