@@ -1,0 +1,31 @@
+# Runtime environment files are supplied by Docker Compose.
+.env
+.env.*
+!.env.example
+
+# Git metadata.
+.git
+
+# Python virtual environments and caches.
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+
+# Node dependencies.
+node_modules
+
+# Runtime audio files and logs.
+audio_files
+*.log
+
+# Generated Celery Beat state.
+celerybeat-schedule*
+
+# Required Docker build inputs.
+!start.sh
+!requirements.txt
+!app/
+!app/**
