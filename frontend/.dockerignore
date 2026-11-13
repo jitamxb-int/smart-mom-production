@@ -1,9 +1,24 @@
+# Dependencies and generated build output.
+node_modules
+.next
+
+# Git metadata.
+.git
+
+# Environment files are supplied separately by Docker Compose.
+.env
+.env.*
+!.env.local.example
+
+# Local tooling and logs.
+.vscode
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+.DS_Store
+
+# Docker configuration is not needed inside the application image.
 Dockerfile
 .dockerignore
-node_modules
-npm-debug.log
-README.md
-.next
-.git
-.env.local
-.vscode
+docker-compose-frontend.yml

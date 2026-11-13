@@ -1,17 +1,22 @@
-version: '3.8'
-
 services:
   frontend:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?Set NEXT_PUBLIC_API_URL in .env.local}
+
     container_name: smart-mom-frontend
+
     restart: unless-stopped
+
     ports:
       - "3015:3015"
+
+    env_file:
+      - .env.local
+
     environment:
-      - NODE_ENV=production
-      - PORT=3015
-    # Uncomment next lines if you want to load environment variables from .env.local file
-    # env_file:
-    #   - .env.local
+      NODE_ENV: production
+      PORT: "3015"
+      HOSTNAME: "0.0.0.0"
