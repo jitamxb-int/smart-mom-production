@@ -12,6 +12,7 @@ Public API:
     load_storage_config_from_db(db)
 """
 import logging
+import os
 from pathlib import Path
 from app.core.config import settings
 
@@ -134,6 +135,12 @@ def _make_backend(name: str) -> BaseStorage:
             raise RuntimeError(
                 f"Cannot create local audio storage directory '{base}'. "
                 f"Set AUDIO_LOCAL_PATH to a writable directory. Error: {e}"
+            )
+        if not os.access(base, os.W_OK | os.X_OK):
+            raise RuntimeError(
+                f"Local audio storage directory '{base}' is not writable by "
+                f"the backend process. Set AUDIO_LOCAL_PATH to a writable "
+                "directory or fix its ownership and permissions."
             )
         logger.info(f"Local audio storage directory: {base}")
         return LocalStorage()

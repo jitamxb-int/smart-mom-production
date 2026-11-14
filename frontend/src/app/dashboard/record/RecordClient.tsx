@@ -282,7 +282,6 @@ export function RecordClient(props: {
 
     const task = (async () => {
       const { data } = await meetingsApi.presignedUpload(details.meeting_id);
-      alert(`Presigned Upload: ${data}`)
       try {
         await meetingsApi.create({
           meeting_id:    details.meeting_id,
@@ -294,9 +293,7 @@ export function RecordClient(props: {
           audio_state:   "chunked",
           meet_link:     details.meet_url || undefined,
         });
-        alert(`Meeting creation done`)
       } catch (e: any) {
-        alert(`Meeting creation error: ${JSON.stringify(e)}`)
         // Another tab/sync already created it — that's fine.
         if (e?.response?.status !== 409) throw e;
       }
@@ -469,7 +466,6 @@ export function RecordClient(props: {
         await deletePendingChunk(meetingId, chunkId).catch(() => {});
         await deleteChunkFile(meetingId, chunkId, mimeType);
       } catch (err: any) {
-        alert(`Error: ${JSON.stringify(err)}`)
         // A timeout or a network failure means we're effectively offline even
         // when navigator.onLine still reports true.
         if (isNetworkError(err) || err?.code === "ECONNABORTED") {
@@ -480,8 +476,10 @@ export function RecordClient(props: {
         try {
           await storeChunk(meetingId, chunkId, blob, mimeType);
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "cached" } : c));
+          toast.error("Upload failed. Audio is saved on this device and will retry when the connection is available.");
         } catch {
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "failed" } : c));
+          toast.error("Upload and local save both failed. Keep this page open and retry before leaving.");
         }
       }
     })();
