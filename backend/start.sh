@@ -5,51 +5,115 @@ echo "  🤖 Smart Mom Backend — Meet Bot Container Starting"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 echo "🖥️  [1/6] Starting Xvfb virtual display..."
+
 rm -f /tmp/.X99-lock 2>/dev/null || true
-Xvfb :99 -screen 0 1280x720x24 -ac +extension GLX +render -noreset &
+
+Xvfb :99 \
+    -screen 0 1280x720x24 \
+    -ac \
+    +extension GLX \
+    +render \
+    -noreset &
+
 export DISPLAY=:99
+
 sleep 2
+
 echo "✅ Xvfb started"
 
 echo "🖥️  [2/6] Starting noVNC on port 6080..."
-x11vnc -display :99 -nopw -listen localhost -xkb -forever -shared -bg -o /tmp/x11vnc.log 2>/dev/null
-websockify --web /usr/share/novnc --wrap-mode=ignore 0.0.0.0:6080 localhost:5900 > /tmp/novnc.log 2>&1 &
+
+x11vnc \
+    -display :99 \
+    -nopw \
+    -listen localhost \
+    -xkb \
+    -forever \
+    -shared \
+    -bg \
+    -o /tmp/x11vnc.log \
+    2>/dev/null
+
+websockify \
+    --web /usr/share/novnc \
+    --wrap-mode=ignore \
+    0.0.0.0:6080 \
+    localhost:5900 \
+    > /tmp/novnc.log 2>&1 &
+
 sleep 2
-echo "✅ noVNC ready  →  http://localhost:6080/vnc.html"
+
+echo "✅ noVNC ready → http://localhost:6080/vnc.html"
 
 echo "🔊 [3/6] Starting PulseAudio..."
+
 pulseaudio --kill 2>/dev/null || true
+
 sleep 1
-# Remove stale PID files that prevent PulseAudio from restarting
-rm -f /run/pulse/pid /var/run/pulse/pid ~/.config/pulse/*.pid 2>/dev/null || true
+
+# Remove stale PID files that can prevent PulseAudio from restarting.
+rm -f \
+    /run/pulse/pid \
+    /var/run/pulse/pid \
+    ~/.config/pulse/*.pid \
+    2>/dev/null || true
+
 mkdir -p /var/run/pulse
 chmod 755 /var/run/pulse
+
 pulseaudio \
-    --system --daemonize=no -n \
+    --system \
+    --daemonize=no \
+    -n \
     --load="module-native-protocol-unix socket=/var/run/pulse/native auth-anonymous=1" \
     --load="module-always-sink" \
-    --exit-idle-time=-1 --log-level=error \
+    --exit-idle-time=-1 \
+    --log-level=error \
     >> /tmp/pulse.log 2>&1 &
 
 export PULSE_SERVER=unix:/var/run/pulse/native
+
 for i in $(seq 1 10); do
     sleep 1
-    if pactl info > /dev/null 2>&1; then echo "✅ PulseAudio running (after ${i}s)"; break; fi
+
+    if pactl info > /dev/null 2>&1; then
+        echo "✅ PulseAudio running (after ${i}s)"
+        break
+    fi
+
     echo "   Waiting for PulseAudio... (${i}s)"
 done
 
 echo "🔌 [4/6] Creating default virtual audio cables..."
-pactl load-module module-null-sink sink_name=VirtualMic sink_properties=device.description=VirtualMic 2>/dev/null
-pactl load-module module-null-sink sink_name=VirtualSpeaker sink_properties=device.description=VirtualSpeaker 2>/dev/null
-pactl load-module module-virtual-source source_name=VirtualMicSource master=VirtualMic.monitor source_properties=device.description=VirtualMicSource 2>/dev/null
+
+pactl load-module module-null-sink \
+    sink_name=VirtualMic \
+    sink_properties=device.description=VirtualMic \
+    2>/dev/null
+
+pactl load-module module-null-sink \
+    sink_name=VirtualSpeaker \
+    sink_properties=device.description=VirtualSpeaker \
+    2>/dev/null
+
+pactl load-module module-virtual-source \
+    source_name=VirtualMicSource \
+    master=VirtualMic.monitor \
+    source_properties=device.description=VirtualMicSource \
+    2>/dev/null
+
 pactl set-default-sink VirtualSpeaker 2>/dev/null
 pactl set-default-source VirtualMicSource 2>/dev/null
+
 echo "✅ Virtual cables created"
 
 echo "🎙️  [5/6] Pre-granting Chrome mic permissions..."
+
 CHROME_PROFILE="${CHROME_BASE_PROFILE:-/tmp/chrome-profile}"
+
 mkdir -p "$CHROME_PROFILE/Default"
-cat > "$CHROME_PROFILE/Default/Preferences" << 'CHROME_PREFS'
+
+cat > "$CHROME_PROFILE/Default/Preferences" <<'CHROME_PREFS'
 {
   "profile": {
     "content_settings": {
@@ -75,20 +139,26 @@ cat > "$CHROME_PROFILE/Default/Preferences" << 'CHROME_PREFS'
       "media_stream_mic": 1
     }
   },
-  "browser": { "has_seen_welcome_page": true }
+  "browser": {
+    "has_seen_welcome_page": true
+  }
 }
 CHROME_PREFS
+
 echo "✅ Chrome profile written to $CHROME_PROFILE"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  ✅ All systems ready. Starting FastAPI on port 3014..."
+echo "  [6/6] Starting FastAPI on port 3014..."
 echo "  👁️  noVNC at: http://localhost:6080/vnc.html"
-echo "  🔌 API  at:  http://localhost:3014"
+echo "  🔌 API at: http://localhost:3014"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 export DISPLAY=:99
 export PULSE_SERVER=unix:/var/run/pulse/native
 export MEET_BOT_RECORDINGS_DIR=/tmp/meet-bot-recordings
 
-exec uvicorn app.main:app --host 0.0.0.0 --port 3014 --log-level info
+exec uvicorn app.main:app \
+    --host 0.0.0.0 \
+    --port 3014 \
+    --log-level info
