@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import AliasChoices, Field, SecretStr
 from typing import Optional, List
 
 
@@ -38,16 +39,26 @@ class Settings(BaseSettings):
     openai_base_url: Optional[str] = None  # For Azure/custom endpoints
 
     # ── AWS S3 ───────────────────────────────────────────────────────────────────
-    # Credentials are resolved automatically by boto3 in this order:
-    # 1. Environment variables (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
-    # 2. ~/.aws/credentials file
-    # 3. EC2 / ECS IAM role (recommended for production)
-    # NEVER hardcode credentials.
-    aws_region: str = "ap-south-1"           # Maps to AWS_REGION env var
-    s3_bucket_name: str = "vyom-backend-demo"   # Maps to S3_BUCKET_NAME env var
+    aws_region: str = Field(
+        default="ap-south-1",
+        validation_alias=AliasChoices("AWS_REGION", "AWS_DEFAULT_REGION"),
+    )
+    s3_bucket_name: str = Field(
+        default="vyom-backend-demo",
+        validation_alias=AliasChoices("S3_BUCKET_NAME", "S3_BUCKET"),
+    )
 
-    # Optional: AWS Session Token for temporary credentials
-    aws_session_token: Optional[str] = None  # Maps to AWS_SESSION_TOKEN env var
+    # Read existing backend .env names as well as the standard AWS names.
+    # Without explicit keys, Boto3 uses its normal provider chain.
+    aws_access_key_id: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AWS_ACCESS_KEY_ID", "ACCESS_KEY"),
+    )
+    aws_secret_access_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AWS_SECRET_ACCESS_KEY", "SECRET_ACCESS_KEY"),
+    )
+    aws_session_token: SecretStr | None = None
 
     # Qdrant Cloud
     qdrant_url: str

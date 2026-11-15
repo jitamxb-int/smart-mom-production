@@ -83,6 +83,8 @@ class LocalStorage(BaseStorage):
         full = base / relative
         try:
             full.parent.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            raise
         except Exception as e:
             raise IOError(
                 f"Cannot create local audio directory '{full.parent}'. "
@@ -147,9 +149,11 @@ def _make_backend(name: str) -> BaseStorage:
     return S3Storage()
 
 
-def get_storage() -> BaseStorage:
-    """Return the currently active storage backend."""
+def get_storage(backend: str | None = None) -> BaseStorage:
+    """Use the active backend for new writes or the recorded backend for existing audio."""
     global _active_backend
+    if backend and (_active_backend is None or backend != _active_backend.backend_name()):
+        return _make_backend(backend)
     if _active_backend is None:
         _active_backend = _make_backend(settings.audio_storage_backend.strip().lower())
         logger.info(f"Storage initialised from env: {_active_backend.backend_name()}")
@@ -174,10 +178,12 @@ async def load_storage_config_from_db(db) -> None:
     """Called once at app startup to restore the admin's last saved choice."""
     try:
         record = await db.system_config.find_one({"key": "audio_storage_backend"})
-        if record and record.get("value") in ("s3", "local"):
-            set_active_backend(record["value"])
-            logger.info(f"Audio storage restored from DB: {record['value'].upper()}")
-        else:
-            logger.info(f"No DB storage config found — using env default: {get_active_backend_name().upper()}")
     except Exception as e:
-        logger.warning(f"Could not load storage config from DB: {e}. Using env default.")
+        logger.warning(f"Could not read storage config from DB: {e}. Using env default.")
+        record = None
+
+    if record and record.get("value") in ("s3", "local"):
+        set_active_backend(record["value"])
+        logger.info(f"Audio storage restored from DB: {record['value'].upper()}")
+    else:
+        logger.info(f"Using audio storage from env: {get_active_backend_name().upper()}")

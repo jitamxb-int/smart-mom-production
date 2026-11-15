@@ -4,7 +4,7 @@ Uses signed S3 requests (IAM role, env vars, or ~/.aws/credentials).
 """
 import boto3
 import logging
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, PartialCredentialsError
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -15,7 +15,23 @@ _s3_client = None
 def get_s3_client():
     global _s3_client
     if _s3_client is None:
-        _s3_client = boto3.client("s3", region_name=settings.aws_region)
+        access_key = settings.aws_access_key_id.get_secret_value() if settings.aws_access_key_id else None
+        secret_key = settings.aws_secret_access_key.get_secret_value() if settings.aws_secret_access_key else None
+        if bool(access_key) != bool(secret_key):
+            raise PartialCredentialsError(
+                provider="backend settings",
+                cred_var="AWS_SECRET_ACCESS_KEY" if access_key else "AWS_ACCESS_KEY_ID",
+            )
+        if access_key and secret_key:
+            _s3_client = boto3.client(
+                "s3",
+                region_name=settings.aws_region,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                aws_session_token=settings.aws_session_token.get_secret_value() if settings.aws_session_token else None,
+            )
+        else:
+            _s3_client = boto3.client("s3", region_name=settings.aws_region)
         logger.info(f"Created S3 client (region: {settings.aws_region})")
     return _s3_client
 
