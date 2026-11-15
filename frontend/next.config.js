@@ -1,4 +1,20 @@
 /** @type {import('next').NextConfig} */
+const { randomUUID } = require("node:crypto");
+const withSerwistInit = require("@serwist/next").default;
+
+const withSerwist = withSerwistInit({
+  swSrc: "src/app/sw.ts",
+  swDest: "public/sw.js",
+  // Precache the offline fallback page so it can be shown for any uncached
+  // navigation while the device has no connection.
+  additionalPrecacheEntries: [
+    { url: "/~offline", revision: randomUUID() },
+  ],
+  // A service worker in development can serve stale assets between rebuilds.
+  // Use `npm run build && npm start` to test the PWA/offline behaviour.
+  disable: process.env.NODE_ENV === "development",
+});
+
 const nextConfig = {
   images: {
     remotePatterns: [
@@ -25,4 +41,4 @@ const nextConfig = {
   },
 };
 
-module.exports = nextConfig;
+module.exports = withSerwist(nextConfig);

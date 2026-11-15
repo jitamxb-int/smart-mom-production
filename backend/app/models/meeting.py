@@ -84,7 +84,7 @@ class CreateMeetingRequest(BaseModel):
     context:       str = Field(max_length=1000)
     no_of_persons: int = Field(ge=1)
     date_time:     datetime
-    audio_s3_key:  str
+    audio_s3_key:  Optional[str] = None
     # "merged" = full upload or successfully merged chunks
     # "chunked" = chunk mode, merge not yet done (e.g. lost connection)
     audio_state:   Optional[str] = "merged"
@@ -101,6 +101,8 @@ class CreateMeetingRequest(BaseModel):
     def check_persons_count(self):
         if self.no_of_persons != len(self.attendees):
             raise ValueError("no_of_persons must equal len(attendees)")
+        if self.audio_state != "chunked" and self.audio_s3_key is None:
+            raise ValueError("audio_s3_key is required for a full audio upload")
         return self
 
 

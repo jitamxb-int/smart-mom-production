@@ -13,6 +13,7 @@ import hmac
 import hashlib
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pymongo.errors import DuplicateKeyError
@@ -26,6 +27,7 @@ from app.models.meeting import (
 from app.worker.tasks.email_notifications import send_transcription_ready_email
 from app.models.serializers import serialize_meeting
 from app.core.config import settings
+from app.core.s3_utils import build_audio_s3_key
 from app.core.storage import get_storage
 import logging
 from bson import ObjectId
@@ -36,6 +38,23 @@ router = APIRouter(prefix="/api/v1/meetings", tags=["meetings"])
 
 # IST Timezone - for reference only, we store IST directly
 IST = ZoneInfo("Asia/Kolkata")
+
+
+def audio_storage_error(error: Exception) -> HTTPException:
+    if isinstance(error, (NoCredentialsError, PartialCredentialsError)):
+        return HTTPException(status_code=503, detail={
+            "code": "S3_CREDENTIALS_UNAVAILABLE",
+            "message": "The server is missing AWS credentials for audio storage.",
+        })
+    if isinstance(error, PermissionError):
+        return HTTPException(status_code=503, detail={
+            "code": "AUDIO_STORAGE_UNWRITABLE",
+            "message": "The server cannot write to its local audio directory.",
+        })
+    return HTTPException(status_code=500, detail={
+        "code": "UPLOAD_FAILED",
+        "message": "The server could not store the audio.",
+    })
 
 
 def format_ist_for_display(date_time_input):
@@ -84,6 +103,9 @@ async def create_meeting(
     # Store date_time as-is from frontend (IST format: YYYY-MM-DDTHH:mm:ss)
     # No timezone conversion - frontend sends IST directly
     date_time_to_store = body.date_time if body.date_time else now.strftime("%Y-%m-%dT%H:%M:%S")
+    audio_key = body.audio_s3_key
+    if audio_key is None:
+        audio_key = build_audio_s3_key(current_user["user_id"], body.meeting_id)
 
     doc = {
         "meeting_id":      body.meeting_id,
@@ -92,7 +114,7 @@ async def create_meeting(
         "context":         body.context,
         "no_of_persons":   body.no_of_persons,
         "date_time":       date_time_to_store,
-        "audio_s3_key":    body.audio_s3_key,
+        "audio_s3_key":    audio_key,
         "storage_backend": get_storage().backend_name(),
         "status":          "audio_uploaded",
         "audio_state":     body.audio_state if hasattr(body, "audio_state") and body.audio_state else "merged",
@@ -153,14 +175,17 @@ async def get_upload_url(
     if not meeting_id:
         raise HTTPException(status_code=422, detail={"code": "MISSING_MEETING_ID"})
 
-    from app.core.s3_utils import build_audio_s3_key
     s3_key  = build_audio_s3_key(current_user["user_id"], meeting_id)
     storage = get_storage()
 
     upload_url = None
 
     if storage.backend_name() == "s3":
-        upload_url = storage.get_upload_presigned_url(s3_key)
+        try:
+            upload_url = storage.get_upload_presigned_url(s3_key)
+        except (NoCredentialsError, PartialCredentialsError) as exc:
+            logger.error("Could not sign audio upload: %s", exc)
+            raise audio_storage_error(exc) from exc
 
     return {
         "upload_url":      upload_url,
@@ -178,7 +203,6 @@ async def upload_audio_direct(
     audio:      UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
 ):
-    from app.core.s3_utils import build_audio_s3_key
     s3_key  = build_audio_s3_key(current_user["user_id"], meeting_id)
     storage = get_storage()
 
@@ -190,7 +214,7 @@ async def upload_audio_direct(
         storage.upload_audio(data, s3_key)
     except Exception as e:
         logger.error(f"Direct upload failed: {e}")
-        raise HTTPException(status_code=500, detail={"code": "UPLOAD_FAILED", "message": str(e)})
+        raise audio_storage_error(e) from e
 
     return {"success": True, "audio_s3_key": s3_key, "size_bytes": len(data)}
 
@@ -203,7 +227,8 @@ async def stream_audio_local(
     current_user: dict = Depends(get_current_user),
     db=Depends(get_db),
 ):
-    if get_storage().backend_name() != "local":
+    storage = get_storage()
+    if storage.backend_name() != "local":
         raise HTTPException(status_code=400, detail={"code": "NOT_LOCAL_STORAGE"})
 
     role = current_user.get("role", "user")
@@ -215,7 +240,7 @@ async def stream_audio_local(
                 raise HTTPException(status_code=403, detail={"code": "FORBIDDEN"})
 
     try:
-        data = get_storage().read_audio(key)
+        data = storage.read_audio(key)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail={"code": "AUDIO_NOT_FOUND",
             "message": f"Audio file not found on disk for key: {key}"})
@@ -265,6 +290,10 @@ async def upload_audio_chunk(
     data = await audio.read()
     if not data:
         raise HTTPException(status_code=400, detail={"code": "EMPTY_CHUNK"})
+    if meeting.get("audio_state") == "merged" and "chunks_merged" in meeting:
+        if 0 <= chunk_id < meeting["chunks_merged"]:
+            return {"success": True, "chunk_id": chunk_id, "already_merged": True}
+        raise HTTPException(status_code=409, detail={"code": "RECORDING_ALREADY_MERGED"})
 
     user_id = meeting["user_id"]
     s3_key  = f"audio/{user_id}/{meeting_id}/chunks/chunk_{chunk_id:05d}.webm"
@@ -289,7 +318,7 @@ async def upload_audio_chunk(
                 }
             )
 
-        raise HTTPException(status_code=500, detail={"code": "UPLOAD_FAILED", "message": str(e)})
+        raise audio_storage_error(e) from e
 
     try:
         ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -334,12 +363,24 @@ async def merge_audio_chunks(
     meeting_id: str,
     current_user: dict = Depends(get_current_user),
     db=Depends(get_db),
+    expected_chunk_count: int | None = Query(default=None, ge=1, le=10000),
 ):
     meeting = await db.meetings.find_one({"meeting_id": meeting_id})
     if not meeting:
         raise HTTPException(status_code=404, detail={"code": "MEETING_NOT_FOUND"})
     if current_user.get("role") != "admin" and meeting["user_id"] != current_user["user_id"]:
         raise HTTPException(status_code=403, detail={"code": "FORBIDDEN"})
+
+    if meeting.get("audio_state") == "merged" and "chunks_merged" in meeting:
+        if expected_chunk_count is not None and expected_chunk_count != meeting["chunks_merged"]:
+            raise HTTPException(status_code=409, detail={"code": "INCOMPLETE_CHUNKS"})
+        return {
+            "success": True,
+            "meeting_id": meeting_id,
+            "chunks_merged": meeting["chunks_merged"],
+            "total_bytes": meeting["audio_size_bytes"],
+            "audio_s3_key": meeting["audio_s3_key"],
+        }
 
     chunks_cursor = db.audio_chunks.find(
         {"meeting_id": meeting_id},
@@ -353,13 +394,21 @@ async def merge_audio_chunks(
             detail={"code": "NO_CHUNKS", "message": "No audio chunks found for this meeting"},
         )
 
+    chunk_count = expected_chunk_count if expected_chunk_count is not None else len(chunks)
+    if [chunk["chunk_id"] for chunk in chunks] != list(range(chunk_count)):
+        raise HTTPException(status_code=409, detail={
+            "code": "INCOMPLETE_CHUNKS",
+            "message": "The server is still missing audio chunks for this recording.",
+        })
+
     storage = get_storage()
     merged_data = bytearray()
     now = datetime.now(timezone.utc)
 
     for chunk in chunks:
         try:
-            data = storage.read_audio(chunk["s3_key"])
+            chunk_storage = get_storage(chunk.get("storage_backend"))
+            data = chunk_storage.read_audio(chunk["s3_key"])
             merged_data.extend(data)
         except Exception as e:
             logger.error(f"Failed to read chunk {chunk['chunk_id']} for {meeting_id}: {e}")
@@ -405,10 +454,7 @@ async def merge_audio_chunks(
                 "merge_error": f"Merge upload failed: {e}",
             }},
         )
-        raise HTTPException(
-            status_code=500,
-            detail={"code": "MERGE_UPLOAD_FAILED", "message": str(e)},
-        )
+        raise audio_storage_error(e) from e
 
     await db.meetings.update_one(
         {"meeting_id": meeting_id},
@@ -417,13 +463,15 @@ async def merge_audio_chunks(
             "storage_backend": storage.backend_name(),
             "status":          "audio_uploaded",
             "audio_state":     "merged",
+            "chunks_merged":   len(chunks),
+            "audio_size_bytes": len(merged_data),
             "updated_at":      now,
-        }},
+        }, "$unset": {"merge_error": ""}},
     )
 
     for chunk in chunks:
         try:
-            storage.delete_audio(chunk["s3_key"])
+            get_storage(chunk.get("storage_backend")).delete_audio(chunk["s3_key"])
         except Exception:
             pass
 
@@ -1268,7 +1316,7 @@ async def get_audio_url(
     origin   = str(request.base_url).rstrip("/")
     audio_url = f"{origin}/api/v1/meetings/{meeting_id}/download-audio?token={urllib.parse.quote(token)}"
 
-    storage = get_storage()
+    storage = get_storage(meeting.get("storage_backend"))
     return {
         "audio_url":       audio_url,
         "storage_backend": storage.backend_name(),
@@ -1335,7 +1383,7 @@ async def download_audio(
         raise HTTPException(status_code=404, detail={"code": "AUDIO_KEY_MISSING"})
 
     try:
-        data = get_storage().read_audio(audio_key)
+        data = get_storage(meeting.get("storage_backend")).read_audio(audio_key)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail={"code": "AUDIO_NOT_FOUND",
             "message": f"Audio file not found: {audio_key}"})
@@ -1379,7 +1427,7 @@ async def delete_meeting(
     await db.meetings.delete_one({"meeting_id": meeting_id})
 
     try:
-        get_storage().delete_audio(meeting["audio_s3_key"])
+        get_storage(meeting.get("storage_backend")).delete_audio(meeting["audio_s3_key"])
     except Exception as e:
         logger.warning(f"Could not delete audio for {meeting_id}: {e}")
 

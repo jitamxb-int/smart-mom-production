@@ -29,8 +29,8 @@ export const meetingsApi = {
   get: (id: string) =>
     apiClient.get(`/api/v1/meetings/${id}`),
 
-  create: (body: Record<string, unknown>) =>
-    apiClient.post("/api/v1/meetings/", body),
+  create: (body: Record<string, unknown>, timeout?: number) =>
+    apiClient.post("/api/v1/meetings/", body, { timeout }),
 
   update: (id: string, body: Record<string, unknown>, force = false) =>
     apiClient.patch(`/api/v1/meetings/${id}`, body, { params: { force } }),
@@ -58,6 +58,7 @@ export const meetingsApi = {
    * Upload a single audio chunk.
    * Endpoint: POST /api/v1/meetings/{meeting_id}/chunks
    * Backend expects form fields: chunk_id (int), timestamp (ISO string), audio (file).
+   * `timestamp` defaults to now; offline chunks pass their original capture time.
    */
   uploadChunk: (
     meetingId: string,
@@ -65,19 +66,24 @@ export const meetingsApi = {
     chunkId:   number,
     _isFinal:  boolean,   // reserved — not used by backend, kept for call-site compat
     mimeType:  string,
+    timestamp: string = new Date().toISOString(),
   ) => {
     const ext  = mimeType.includes("ogg") ? "ogg" : "webm";
     const form = new FormData();
     form.append("chunk_id",  String(chunkId));
-    form.append("timestamp", new Date().toISOString());
+    form.append("timestamp", timestamp);
     form.append("audio",     blob, `chunk_${String(chunkId).padStart(5, "0")}.${ext}`);
     return apiClient.post(`/api/v1/meetings/${meetingId}/chunks`, form, {
       headers: { "Content-Type": "multipart/form-data" },
+      timeout: 30_000,
     });
   },
 
-  mergeChunks: (meetingId: string) =>
-    apiClient.post(`/api/v1/meetings/${meetingId}/merge-chunks`),
+  mergeChunks: (meetingId: string, expectedChunkCount?: number) =>
+    apiClient.post(`/api/v1/meetings/${meetingId}/merge-chunks`, undefined, {
+      params: { expected_chunk_count: expectedChunkCount },
+      timeout: 60_000,
+    }),
 
   audioUrl: (id: string) =>
     apiClient.get(`/api/v1/meetings/${id}/audio-url`),
