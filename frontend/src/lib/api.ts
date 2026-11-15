@@ -29,8 +29,8 @@ export const meetingsApi = {
   get: (id: string) =>
     apiClient.get(`/api/v1/meetings/${id}`),
 
-  create: (body: Record<string, unknown>) =>
-    apiClient.post("/api/v1/meetings/", body),
+  create: (body: Record<string, unknown>, timeout?: number) =>
+    apiClient.post("/api/v1/meetings/", body, { timeout }),
 
   update: (id: string, body: Record<string, unknown>, force = false) =>
     apiClient.patch(`/api/v1/meetings/${id}`, body, { params: { force } }),
@@ -75,11 +75,15 @@ export const meetingsApi = {
     form.append("audio",     blob, `chunk_${String(chunkId).padStart(5, "0")}.${ext}`);
     return apiClient.post(`/api/v1/meetings/${meetingId}/chunks`, form, {
       headers: { "Content-Type": "multipart/form-data" },
+      timeout: 30_000,
     });
   },
 
-  mergeChunks: (meetingId: string) =>
-    apiClient.post(`/api/v1/meetings/${meetingId}/merge-chunks`),
+  mergeChunks: (meetingId: string, expectedChunkCount?: number) =>
+    apiClient.post(`/api/v1/meetings/${meetingId}/merge-chunks`, undefined, {
+      params: { expected_chunk_count: expectedChunkCount },
+      timeout: 60_000,
+    }),
 
   audioUrl: (id: string) =>
     apiClient.get(`/api/v1/meetings/${id}/audio-url`),

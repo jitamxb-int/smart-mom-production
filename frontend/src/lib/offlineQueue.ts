@@ -32,6 +32,8 @@ export interface PendingMeeting {
   /** Whether the backend meeting record has been created. */
   created: boolean;
   created_at: string;
+  /** Set when the recorder stops so a retry can check for missing audio. */
+  expected_chunk_count?: number;
 }
 
 const DB_NAME = "meetmind_chunks";
@@ -72,12 +74,13 @@ async function withStore<T>(
     const tx = db.transaction(storeName, mode);
     const req = run(tx.objectStore(storeName));
 
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-    tx.oncomplete = () => db.close();
-    tx.onerror = () => {
+    tx.oncomplete = () => {
       db.close();
-      reject(tx.error);
+      resolve(req.result);
+    };
+    tx.onabort = () => {
+      db.close();
+      reject(tx.error ?? req.error);
     };
   });
 }
@@ -138,8 +141,15 @@ export function deletePendingMeeting(meetingId: string): Promise<undefined> {
   return withStore(MEETING_STORE, "readwrite", (store) => store.delete(meetingId));
 }
 
-export async function markPendingMeetingCreated(meetingId: string): Promise<void> {
-  const meeting = await getPendingMeeting(meetingId);
-  if (!meeting) return;
-  await savePendingMeeting({ ...meeting, created: true });
+export function updatePendingMeeting(
+  meetingId: string,
+  changes: Pick<Partial<PendingMeeting>, "created" | "expected_chunk_count">,
+): Promise<void> {
+  return withStore(MEETING_STORE, "readwrite", (store) => {
+    const request = store.get(meetingId) as IDBRequest<PendingMeeting | undefined>;
+    request.onsuccess = () => {
+      if (request.result) store.put({ ...request.result, ...changes });
+    };
+    return request;
+  }).then(() => {});
 }

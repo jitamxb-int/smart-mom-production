@@ -18,12 +18,13 @@ import { useRouter } from "next/navigation";
 import { signOut } from "next-auth/react";
 import Image from "next/image";
 import Link from "next/link";
+import { isAxiosError } from "axios";
 import { meetingsApi } from "@/lib/api";
 import { getCurrentISTISO } from "@/lib/dateUtils";
 import {
   savePendingChunk, updatePendingChunkStatus, deletePendingChunk,
   getPendingChunksForMeeting, getAllPendingChunks,
-  savePendingMeeting, getPendingMeeting, markPendingMeetingCreated,
+  savePendingMeeting, getPendingMeeting, updatePendingMeeting,
   deletePendingMeeting, getAllPendingMeetings,
   type PendingChunk, type PendingMeeting,
 } from "@/lib/offlineQueue";
@@ -66,8 +67,27 @@ function getChunkDurationSeconds(): number {
 const CHUNK_DURATION_SECONDS = getChunkDurationSeconds();
 
 /** Axios network/timeout failures have no HTTP response attached. */
-function isNetworkError(err: any): boolean {
-  return !err?.response;
+function isNetworkError(error: unknown): boolean {
+  return isAxiosError(error) && !error.response;
+}
+
+function pendingUploadMessage(error: unknown): string {
+  if (!navigator.onLine || isNetworkError(error)) {
+    return "Audio is saved on this device. Upload will retry when the server is reachable.";
+  }
+  if (isAxiosError(error)) {
+    if (error.response?.status === 401) {
+      return "Audio is saved on this device. Sign in again to resume the upload.";
+    }
+    const code = error.response?.data?.detail?.code;
+    if (code === "S3_CREDENTIALS_UNAVAILABLE" || code === "AUDIO_STORAGE_UNWRITABLE") {
+      return "Audio is saved on this device. The server’s audio storage is unavailable.";
+    }
+    if (code === "INCOMPLETE_CHUNKS" || code === "NO_CHUNKS") {
+      return "The server is missing audio chunks. This recording is still pending.";
+    }
+  }
+  return "Audio upload is pending. Retry from this screen.";
 }
 
 function formatTime(sec: number) {
@@ -209,7 +229,8 @@ export function RecordClient(props: {
   const pendingUploadsRef = useRef<Set<Promise<void>>>(new Set());
   const creatingRef       = useRef<Map<string, Promise<void>>>(new Map());
   const retryingRef       = useRef(false);
-  const networkErrorRef   = useRef(false);
+  const cachedUploadsRef  = useRef(new Map<string, Promise<void>>());
+  const unsavedChunkRef   = useRef(false);
   const networkDownRef    = useRef(false);
   const wakeLockRef = useRef<any>(null);
 
@@ -239,9 +260,13 @@ export function RecordClient(props: {
 
   const checkGP = useCallback(async () => {
     try {
-      const all = await getAllPendingChunks();
-      const f   = currentMeetingRef.current ? all.filter(c => c.meeting_id !== currentMeetingRef.current) : all;
-      setGlobalPending(f.length);
+      const [chunks, meetings] = await Promise.all([getAllPendingChunks(), getAllPendingMeetings()]);
+      const ids = new Set(chunks.map(chunk => chunk.meeting_id));
+      for (const meeting of meetings) {
+        if (meeting.expected_chunk_count || meeting.created) ids.add(meeting.meeting_id);
+      }
+      if (currentMeetingRef.current) ids.delete(currentMeetingRef.current);
+      setGlobalPending(ids.size);
     } catch {}
   }, []);
 
@@ -281,7 +306,6 @@ export function RecordClient(props: {
     if (inFlight) return inFlight;
 
     const task = (async () => {
-      const { data } = await meetingsApi.presignedUpload(details.meeting_id);
       try {
         await meetingsApi.create({
           meeting_id:    details.meeting_id,
@@ -289,15 +313,14 @@ export function RecordClient(props: {
           context:       details.context,
           no_of_persons: details.no_of_persons,
           date_time:     details.date_time,
-          audio_s3_key:  data.audio_s3_key,
           audio_state:   "chunked",
           meet_link:     details.meet_url || undefined,
-        });
+        }, 15_000);
       } catch (e: any) {
         // Another tab/sync already created it — that's fine.
         if (e?.response?.status !== 409) throw e;
       }
-      await markPendingMeetingCreated(details.meeting_id);
+      await updatePendingMeeting(details.meeting_id, { created: true });
     })();
 
     creatingRef.current.set(details.meeting_id, task);
@@ -332,85 +355,77 @@ export function RecordClient(props: {
     }
   }, []);
 
-  const retryCachedChunks = useCallback(async (meetingId: string): Promise<boolean> => {
-    networkErrorRef.current = false;
-    if (!navigator.onLine) return false;
+  const retryCachedChunks = useCallback(async (meetingId: string) => {
+    const inFlight = cachedUploadsRef.current.get(meetingId);
+    if (inFlight) return inFlight;
 
-    // A recording started offline has no backend record yet — create it first.
-    try {
-      const pendingMeeting = await getPendingMeeting(meetingId);
-      if (pendingMeeting && !pendingMeeting.created) {
-        await ensureMeetingCreated(pendingMeeting);
+    const task = (async () => {
+      const meeting = await getPendingMeeting(meetingId);
+      if (meeting && !meeting.created) await ensureMeetingCreated(meeting);
+
+      const chunks = await getPendingChunksForMeeting(meetingId);
+      for (const chunk of chunks.sort((a, b) => a.chunk_id - b.chunk_id)) {
+        if (chunk.status === "uploaded") continue;
+
+        const mimeType = chunk.mime_type || "audio/webm";
+        const blob = chunk.blob ?? await readChunkFile(meetingId, chunk.chunk_id, mimeType);
+        try {
+          await meetingsApi.uploadChunk(meetingId, blob, chunk.chunk_id, false, mimeType, chunk.timestamp);
+        } catch (error) {
+          // Older local records can outlive a failed or removed server meeting.
+          if (!meeting || !isAxiosError(error) || error.response?.data?.detail?.code !== "MEETING_NOT_FOUND") {
+            throw error;
+          }
+          await ensureMeetingCreated(meeting);
+          await meetingsApi.uploadChunk(meetingId, blob, chunk.chunk_id, false, mimeType, chunk.timestamp);
+        }
+        await updatePendingChunkStatus(meetingId, chunk.chunk_id, "uploaded");
+        if (!chunk.blob) await deleteChunkFile(meetingId, chunk.chunk_id, mimeType);
+        if (currentMeetingRef.current === meetingId) {
+          setChunkStatuses(prev => prev.map(c => c.chunk_id === chunk.chunk_id ? { ...c, status: "done" } : c));
+        }
       }
-    } catch (e: any) {
-      const networkErr = isNetworkError(e);
-      networkErrorRef.current = networkErr || e?.response?.status === 401;
-      if (networkErr) {
+      networkDownRef.current = false;
+      setIsOffline(false);
+    })();
+
+    cachedUploadsRef.current.set(meetingId, task);
+    try {
+      await task;
+    } finally {
+      cachedUploadsRef.current.delete(meetingId);
+    }
+  }, [ensureMeetingCreated]);
+
+  const retryDuringRecording = useCallback((meetingId: string) => {
+    if (isStoppingRef.current || isBotRef.current) return;
+    void retryCachedChunks(meetingId).catch(error => {
+      if (isNetworkError(error)) {
         networkDownRef.current = true;
         setIsOffline(true);
       }
-      return false;
+    });
+  }, [retryCachedChunks]);
+
+  const finishUpload = useCallback(async (meetingId: string) => {
+    await retryCachedChunks(meetingId);
+    const meeting = await getPendingMeeting(meetingId);
+    try {
+      await meetingsApi.mergeChunks(meetingId, meeting?.expected_chunk_count);
+    } catch (error) {
+      // An older backend could finish the merge without returning a response.
+      if (meeting?.expected_chunk_count != null || !isAxiosError(error) ||
+          error.response?.data?.detail?.code !== "NO_CHUNKS") {
+        throw error;
+      }
+      const { data } = await meetingsApi.get(meetingId);
+      if (data?.data?.audio_state !== "merged") throw error;
     }
-
-    let cached: PendingChunk[];
-    try { cached = await getPendingChunksForMeeting(meetingId); } catch { return false; }
-    if (!cached.length) return true;
-
-    let ok = true;
-    for (const c of cached.sort((a, b) => a.chunk_id - b.chunk_id)) {
-      if (!navigator.onLine) return false;
-      setChunkStatuses(prev => {
-        const n = [...prev]; const i = n.findIndex(x => x.chunk_id === c.chunk_id);
-        if (i >= 0) n[i] = { ...n[i], status: "uploading" };
-        else n.push({ chunk_id: c.chunk_id, status: "uploading", size_bytes: c.size_bytes });
-        return n;
-      });
-
-      const mimeType = c.mime_type || mimeTypeRef.current;
-
-      // A previous sync uploaded this chunk but was interrupted before cleanup.
-      if (c.status === "uploaded") {
-        if (!c.blob) await deleteChunkFile(meetingId, c.chunk_id, mimeType);
-        await deletePendingChunk(meetingId, c.chunk_id).catch(() => {});
-        setChunkStatuses(prev => prev.map(x => x.chunk_id === c.chunk_id ? { ...x, status: "done" } : x));
-        continue;
-      }
-
-      let blob: Blob;
-      try {
-        blob = c.blob ?? await readChunkFile(meetingId, c.chunk_id, mimeType);
-      } catch {
-        // Audio file is missing; keep the record so the meeting isn't merged
-        // with incomplete audio.
-        await updatePendingChunkStatus(meetingId, c.chunk_id, "failed").catch(() => {});
-        setChunkStatuses(prev => prev.map(x => x.chunk_id === c.chunk_id ? { ...x, status: "failed" } : x));
-        ok = false;
-        continue;
-      }
-
-      try {
-        await meetingsApi.uploadChunk(meetingId, blob, c.chunk_id, false, mimeType, c.timestamp);
-        await updatePendingChunkStatus(meetingId, c.chunk_id, "uploaded").catch(() => {});
-        if (!c.blob) await deleteChunkFile(meetingId, c.chunk_id, mimeType);
-        await deletePendingChunk(meetingId, c.chunk_id).catch(() => {});
-        networkDownRef.current = false;
-        setIsOffline(false);
-        setChunkStatuses(prev => prev.map(x => x.chunk_id === c.chunk_id ? { ...x, status: "done" } : x));
-      } catch (e: any) {
-        const networkErr = isNetworkError(e);
-        if (networkErr || e?.response?.status === 401) networkErrorRef.current = true;
-        if (networkErr) {
-          networkDownRef.current = true;
-          setIsOffline(true);
-        }
-        await updatePendingChunkStatus(meetingId, c.chunk_id, "failed").catch(() => {});
-        setChunkStatuses(prev => prev.map(x => x.chunk_id === c.chunk_id ? { ...x, status: "cached" } : x));
-        ok = false;
-        if (networkErr) break;
-      }
-    }
-    return ok;
-  }, [ensureMeetingCreated]);
+    const chunks = await getPendingChunksForMeeting(meetingId);
+    await Promise.all(chunks.map(chunk => deletePendingChunk(meetingId, chunk.chunk_id)));
+    await deletePendingMeeting(meetingId);
+    await deleteMeetingChunks(meetingId);
+  }, [retryCachedChunks]);
 
   useEffect(() => () => {
     if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
@@ -453,12 +468,15 @@ export function RecordClient(props: {
           await storeChunk(meetingId, chunkId, blob, mimeType);
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "cached" } : c));
         } catch {
+          unsavedChunkRef.current = true;
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "failed" } : c));
         }
         return;
       }
 
       try {
+        const meeting = await getPendingMeeting(meetingId);
+        if (meeting && !meeting.created) await ensureMeetingCreated(meeting);
         await meetingsApi.uploadChunk(meetingId, blob, chunkId, false, mimeType);
         networkDownRef.current = false;
         setIsOffline(false);
@@ -476,153 +494,55 @@ export function RecordClient(props: {
         try {
           await storeChunk(meetingId, chunkId, blob, mimeType);
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "cached" } : c));
-          toast.error("Upload failed. Audio is saved on this device and will retry when the connection is available.");
+          toast.error(pendingUploadMessage(err), { id: "recording-upload" });
         } catch {
+          unsavedChunkRef.current = true;
           setChunkStatuses(prev => prev.map(c => c.chunk_id === chunkId ? { ...c, status: "failed" } : c));
-          toast.error("Upload and local save both failed. Keep this page open and retry before leaving.");
+          toast.error("An audio chunk could not be uploaded or saved on this device.", { id: "recording-upload" });
         }
       }
     })();
 
     pendingUploadsRef.current.add(promise);
     promise.finally(() => pendingUploadsRef.current.delete(promise));
-  }, [storeChunk]);
+  }, [storeChunk, ensureMeetingCreated]);
 
-  const retryAllPending = useCallback(async () => {
+  const retryAllPending = useCallback(async (manual = false) => {
     if (!navigator.onLine || retryingRef.current || !accessToken) return;
     retryingRef.current = true;
     setIsRetrying(true);
     try {
-      const all     = await getAllPendingChunks();
-      const current = currentMeetingRef.current;
-      const byMeeting = new Map<string, PendingChunk[]>();
-      for (const c of all) {
-        if (c.meeting_id === current) continue; // still recording
-        if (!byMeeting.has(c.meeting_id)) byMeeting.set(c.meeting_id, []);
-        byMeeting.get(c.meeting_id)!.push(c);
+      const [chunks, meetings] = await Promise.all([getAllPendingChunks(), getAllPendingMeetings()]);
+      const meetingIds = new Set(chunks.map(chunk => chunk.meeting_id));
+      for (const meeting of meetings) {
+        if (meeting.expected_chunk_count || meeting.created) meetingIds.add(meeting.meeting_id);
       }
 
-      for (const [mid, chunks] of byMeeting) {
+      for (const meetingId of meetingIds) {
         if (!navigator.onLine) break;
-
-        let ok = true;
+        if (meetingId === currentMeetingRef.current) continue;
         try {
-          // Create the meeting if the recording started offline.
-          const pendingMeeting = await getPendingMeeting(mid);
-          if (pendingMeeting && !pendingMeeting.created) {
-            await ensureMeetingCreated(pendingMeeting);
-          }
-        } catch (e: any) {
-          if (isNetworkError(e)) {
-            networkDownRef.current = true;
-            setIsOffline(true);
-          }
-          ok = false;
-        }
-
-        if (ok) {
-          for (const c of chunks.sort((a, b) => a.chunk_id - b.chunk_id)) {
-            if (!navigator.onLine) { ok = false; break; }
-
-            const mimeType = c.mime_type || mimeTypeRef.current;
-
-            // A previous sync uploaded this chunk but was interrupted before cleanup.
-            if (c.status === "uploaded") {
-              if (!c.blob) await deleteChunkFile(mid, c.chunk_id, mimeType);
-              await deletePendingChunk(mid, c.chunk_id).catch(() => {});
-              continue;
-            }
-
-            let blob: Blob;
-            try {
-              blob = c.blob ?? await readChunkFile(mid, c.chunk_id, mimeType);
-            } catch {
-              await updatePendingChunkStatus(mid, c.chunk_id, "failed").catch(() => {});
-              ok = false;
-              break;
-            }
-
-            try {
-              await meetingsApi.uploadChunk(mid, blob, c.chunk_id, false, mimeType, c.timestamp);
-              await updatePendingChunkStatus(mid, c.chunk_id, "uploaded").catch(() => {});
-              if (!c.blob) await deleteChunkFile(mid, c.chunk_id, mimeType);
-              await deletePendingChunk(mid, c.chunk_id).catch(() => {});
-            } catch (e: any) {
-              if (isNetworkError(e)) {
-                networkDownRef.current = true;
-                setIsOffline(true);
-              }
-              await updatePendingChunkStatus(mid, c.chunk_id, "failed").catch(() => {});
-              ok = false;
-            }
-          }
-        }
-
-        if (!ok || !navigator.onLine) {
-          if (networkDownRef.current) break;
-          continue;
-        }
-
-        try {
-          await meetingsApi.mergeChunks(mid);
-          await deletePendingMeeting(mid);
-          await deleteMeetingChunks(mid);
-          networkDownRef.current = false;
-          setIsOffline(false);
-          if (mid === chunkMeetingId) {
+          await finishUpload(meetingId);
+          if (meetingId === chunkMeetingId) {
             setPendingSync(false);
-            setStatusMsg("Offline recording uploaded!");
-          } else {
-            toast.success(`Meeting ${mid.slice(-8)} merged`);
+            setStatusMsg("Recording uploaded.");
           }
-        } catch (e: any) {
-          if (isNetworkError(e)) {
-            networkDownRef.current = true;
-            setIsOffline(true);
-          }
-          toast.error(`Merge failed: ${e?.message || "unknown error"}`);
+          toast.success("Pending recording uploaded.");
+        } catch (error) {
+          const message = pendingUploadMessage(error);
+          if (meetingId === chunkMeetingId) setStatusMsg(message);
+          if (manual) toast.error(message, { id: "recording-upload" });
+          if (isNetworkError(error) || (isAxiosError(error) && error.response?.status === 401)) break;
         }
       }
-
-      // Offline-started meetings that no longer have queued chunks either never
-      // captured audio or already had every chunk uploaded. Clean those up and
-      // retry a merge that may have been interrupted (e.g. tab closed).
-      const chunkMeetingIds = new Set(all.map(c => c.meeting_id));
-      const pendingMeetings = await getAllPendingMeetings();
-      for (const m of pendingMeetings) {
-        if (m.meeting_id === current || chunkMeetingIds.has(m.meeting_id)) continue;
-
-        if (!m.created) {
-          await deletePendingMeeting(m.meeting_id);
-          await deleteMeetingChunks(m.meeting_id);
-          continue;
-        }
-
-        try {
-          await meetingsApi.mergeChunks(m.meeting_id);
-          await deletePendingMeeting(m.meeting_id);
-          await deleteMeetingChunks(m.meeting_id);
-          if (m.meeting_id === chunkMeetingId) {
-            setPendingSync(false);
-            setStatusMsg("Offline recording uploaded!");
-          }
-        } catch (e: any) {
-          // NO_CHUNKS means the merge already completed.
-          if (e?.response?.data?.detail?.code === "NO_CHUNKS") {
-            await deletePendingMeeting(m.meeting_id);
-            await deleteMeetingChunks(m.meeting_id);
-          }
-        }
-      }
-
-      await checkGP();
     } catch {
-      // Best effort — the queue is kept for the next sync attempt.
+      if (manual) toast.error("Could not read queued recordings from this device.");
     } finally {
+      await checkGP();
       retryingRef.current = false;
       setIsRetrying(false);
     }
-  }, [accessToken, checkGP, ensureMeetingCreated, chunkMeetingId]);
+  }, [accessToken, checkGP, finishUpload, chunkMeetingId]);
 
   const flushChunk = useCallback((meetingId: string, mimeType: string) => {
     chunkStartElapsedRef.current = elapsedRef.current;
@@ -649,7 +569,9 @@ export function RecordClient(props: {
       setIsOffline(true);
       // Flush the buffered audio immediately so a sudden disconnect doesn't
       // have to wait for the next chunk boundary.
-      if (currentMeetingRef.current) flushChunk(currentMeetingRef.current, mimeTypeRef.current);
+      if (currentMeetingRef.current && !isStoppingRef.current) {
+        flushChunk(currentMeetingRef.current, mimeTypeRef.current);
+      }
     };
     const on  = () => {
       networkDownRef.current = false;
@@ -657,7 +579,7 @@ export function RecordClient(props: {
       if (currentMeetingRef.current) {
         // Still recording: create the record if needed and drain cached chunks,
         // but don't merge until the user stops.
-        retryCachedChunks(currentMeetingRef.current);
+        retryDuringRecording(currentMeetingRef.current);
       } else {
         // Nothing is recording — finish any meetings saved while offline.
         retryAllPending();
@@ -668,7 +590,7 @@ export function RecordClient(props: {
     networkDownRef.current = !navigator.onLine;
     setIsOffline(!navigator.onLine);
     return () => { window.removeEventListener("offline", off); window.removeEventListener("online", on); };
-  }, [retryCachedChunks, retryAllPending, checkGP, flushChunk]);
+  }, [retryDuringRecording, retryAllPending, checkGP, flushChunk]);
 
   useEffect(() => {
     const retry = () => {
@@ -677,7 +599,7 @@ export function RecordClient(props: {
       const meetingId = currentMeetingRef.current;
 
       if (meetingId) {
-        void retryCachedChunks(meetingId);
+        retryDuringRecording(meetingId);
       } else {
         void retryAllPending();
       }
@@ -713,7 +635,7 @@ export function RecordClient(props: {
       );
       clearInterval(interval);
     };
-  }, [retryCachedChunks, retryAllPending]);
+  }, [retryDuringRecording, retryAllPending]);
 
   // On page load, upload anything queued while offline (e.g. the tab was closed
   // before the connection came back). Wait until the auth token is available.
@@ -723,70 +645,56 @@ export function RecordClient(props: {
   }, [accessToken]);
 
   const triggerMerge = useCallback(async (meetingId: string) => {
+    const pending = Array.from(pendingUploadsRef.current);
+    const expectedChunkCount = chunkIdRef.current;
+    let metadataSaved = false;
     try {
-      const pending = Array.from(pendingUploadsRef.current);
-      if (pending.length > 0) {
-        setStatusMsg(`Waiting for ${pending.length} upload${pending.length > 1 ? "s" : ""} to finish…`);
-        await Promise.allSettled(pending);
-      }
-
-      // Stopped without a connection: keep the chunks and let the online
-      // handler (or the next page load) finish the upload and merge.
-      if (!navigator.onLine) {
-        setPendingSync(true);
-        setStatusMsg("Recording saved on this device — it will upload when you're back online.");
-        setState("done");
-        currentMeetingRef.current = null;
-        return;
-      }
-
-      // Create the backend record if the recording started offline.
-      const pendingMeeting = await getPendingMeeting(meetingId);
-      if (pendingMeeting && !pendingMeeting.created) {
-        await ensureMeetingCreated(pendingMeeting);
-      }
-
-      setStatusMsg("Merging audio chunks…");
-      const uploaded = await retryCachedChunks(meetingId);
-      if (!uploaded) {
-        if (!navigator.onLine || networkErrorRef.current) {
-          setPendingSync(true);
-          setStatusMsg("Recording saved on this device — it will upload when you're back online.");
-          setState("done");
-          currentMeetingRef.current = null;
-          return;
-        }
-        setError("Some audio chunks could not be uploaded. Chunks saved — retry from the meetings page.");
+      if (!expectedChunkCount) {
+        await deletePendingMeeting(meetingId);
+        setError("No audio was captured. Check your microphone and try again.");
         setState("error");
         return;
       }
-
-      await meetingsApi.mergeChunks(meetingId);
-      await deletePendingMeeting(meetingId);
-      await deleteMeetingChunks(meetingId);
-
+      await updatePendingMeeting(meetingId, { expected_chunk_count: expectedChunkCount });
+      metadataSaved = true;
+      if (pending.length) {
+        setStatusMsg("Waiting for audio chunks…");
+        await Promise.allSettled(pending);
+      }
+      if (unsavedChunkRef.current) {
+        setError("Some audio could not be saved. The incomplete recording was kept on this device.");
+        setState("error");
+        return;
+      }
+      if (!navigator.onLine) {
+        setPendingSync(true);
+        setStatusMsg(pendingUploadMessage(null));
+        setState("done");
+        return;
+      }
+      // An upload started during recording may have taken its queue snapshot
+      // before the final chunk was stored. Wait for it before the final pass.
+      await cachedUploadsRef.current.get(meetingId)?.catch(() => {});
+      setStatusMsg("Uploading and merging audio…");
+      await finishUpload(meetingId);
       setPendingSync(false);
       setStatusMsg("Done!");
       setState("done");
-      currentMeetingRef.current = null;
-      if (!isSimpleUser) {
-        setTimeout(() => router.push("/dashboard/meetings"), 2000);
-      }
-    } catch (e: any) {
-      // The connection may have dropped between the uploads and the merge.
-      // A 401 means the session expired; keep the audio queued for after the
-      // user signs in again.
-      if (!navigator.onLine || isNetworkError(e) || e?.response?.status === 401) {
+      if (!isSimpleUser) setTimeout(() => router.push("/dashboard/meetings"), 2000);
+    } catch (error) {
+      if (metadataSaved) {
         setPendingSync(true);
-        setStatusMsg("Recording saved on this device — it will upload when you're back online.");
+        setStatusMsg(pendingUploadMessage(error));
         setState("done");
-        currentMeetingRef.current = null;
-        return;
+      } else {
+        setError("Could not save the recording’s upload status on this device.");
+        setState("error");
       }
-      setError(`Merge failed: ${e.message}. Chunks saved — retry from the meetings page.`);
-      setState("error");
+    } finally {
+      currentMeetingRef.current = null;
+      void checkGP();
     }
-  }, [retryCachedChunks, ensureMeetingCreated, router, isSimpleUser]);
+  }, [checkGP, finishUpload, router, isSimpleUser]);
 
   const submitForm = useCallback(() => {
     if (!validateMeta(meta, setMetaError)) return;
@@ -797,6 +705,7 @@ export function RecordClient(props: {
     if (!formDone) return;
     setError(""); setChunkStatuses([]); setPendingSync(false);
     chunkIdRef.current = 0; isStoppingRef.current = false;
+    unsavedChunkRef.current = false;
     pendingUploadsRef.current.clear();
     isBotRef.current = false;
     setNovncUrl(null);
@@ -917,7 +826,7 @@ export function RecordClient(props: {
       };
 
       retryTimerRef.current = setInterval(() => {
-        if (navigator.onLine) retryCachedChunks(meetingId);
+        if (navigator.onLine) retryDuringRecording(meetingId);
       }, 15_000);
       mr.start(1000);
       elapsedRef.current = 0; chunkStartElapsedRef.current = 0;
@@ -940,7 +849,7 @@ export function RecordClient(props: {
       currentMeetingRef.current = null;
       setState("idle");
     }
-  }, [formDone, meta, flushChunk, retryCachedChunks, triggerMerge, selectedDeviceId, refreshAudioDevices, ensureMeetingCreated]);
+  }, [formDone, meta, flushChunk, retryDuringRecording, triggerMerge, selectedDeviceId, refreshAudioDevices, ensureMeetingCreated]);
 
   const togglePause = useCallback(() => {
     const mr = mrRef.current; if (!mr) return;
@@ -1002,7 +911,7 @@ export function RecordClient(props: {
       state === "recording" ? (isBotRef.current ? "Bot recording · active" : isOffline ? "Recording · offline (caching)" : "Recording · uploading")
       : state === "paused"  ? "Paused"
       : state === "merging" ? (statusMsg || "Finalising upload…")
-      : state === "done"    ? (isBotRef.current ? "Bot recording saved" : pendingSync ? "Saved offline" : "Done")
+      : state === "done"    ? (isBotRef.current ? "Bot recording saved" : pendingSync ? "Upload pending" : "Done")
       : state === "error"   ? "Error"
       : "Ready";
 
@@ -1056,7 +965,7 @@ export function RecordClient(props: {
 
               <div className="mt-4">
                 <p className="text-lg font-semibold text-gray-900">
-                  {state === "recording" ? (isBotRef.current ? "Bot Recording…" : "Recording…") : state === "merging" ? "Finalising…" : state === "done" ? (isBotRef.current ? "Bot Recording Saved" : pendingSync ? "Saved Offline" : "Saved") : "Ready"}
+                  {state === "recording" ? (isBotRef.current ? "Bot Recording…" : "Recording…") : state === "merging" ? "Finalising…" : state === "done" ? (isBotRef.current ? "Bot Recording Saved" : pendingSync ? "Upload Pending" : "Saved") : "Ready"}
                 </p>
                 <p className="mt-1 text-sm text-gray-500">
                   {state === "recording" && isBotRef.current
@@ -1067,7 +976,7 @@ export function RecordClient(props: {
                         ? (statusMsg || "Uploading and merging audio…")
                         : state === "done"
                           ? pendingSync
-                            ? "Audio is stored on this device and will upload automatically when you're back online."
+                            ? statusMsg
                             : "You can start a new recording."
                           : "Press start to begin recording immediately."}
                 </p>
@@ -1209,8 +1118,14 @@ export function RecordClient(props: {
               )}
 
               <div className="mt-4 text-xs text-gray-400">
-                {pendingSync ? "Offline — will upload when you're back online." : isOffline ? "Offline — audio will be cached locally." : "Online"}
+                {isOffline ? "Offline" : "Online"}
               </div>
+              {globalPending > 0 && (
+                <button type="button" onClick={() => void retryAllPending(true)} disabled={isRetrying || isOffline || !accessToken}
+                  className="mt-3 text-sm font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50">
+                  {isRetrying ? "Uploading…" : `Retry ${globalPending} pending recording${globalPending === 1 ? "" : "s"}`}
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -1238,9 +1153,9 @@ export function RecordClient(props: {
           <div className="mb-4 flex items-center justify-between gap-3 p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800">
             <span className="flex items-center gap-2">
               <WifiOff className="h-4 w-4" />
-              {globalPending} chunk{globalPending > 1 ? "s" : ""} pending from a previous session.
+              {globalPending} recording{globalPending > 1 ? "s" : ""} pending upload.
             </span>
-            <button onClick={retryAllPending} disabled={isRetrying}
+            <button onClick={() => void retryAllPending(true)} disabled={isRetrying || isOffline || !accessToken}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 text-white rounded-lg text-xs font-medium hover:bg-amber-700 disabled:opacity-50">
               {isRetrying ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />} Retry
             </button>
@@ -1258,7 +1173,7 @@ export function RecordClient(props: {
                     {pendingSync ? <WifiOff className="h-10 w-10 text-white" /> : <CheckCircle2 className="h-10 w-10 text-white" />}
                   </div>
                   <p className="text-white font-semibold text-lg">
-                    {isBotRef.current ? "Bot Recording Saved!" : pendingSync ? "Saved Offline!" : "Chunks uploaded!"}
+                    {isBotRef.current ? "Bot Recording Saved!" : pendingSync ? "Upload Pending" : "Recording Uploaded"}
                   </p>
                   <p className="text-white/70 text-sm">
                     {isBotRef.current
